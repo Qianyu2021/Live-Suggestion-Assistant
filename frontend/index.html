@@ -1,0 +1,665 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Live Meeting Assistant</title>
+  <style>
+    /* ── Reset & base ────────────────────────────────────────────────────── */
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+    :root {
+      --bg:           #0f1117;
+      --bg-col:       #161b27;
+      --bg-card:      #1c2333;
+      --bg-card-old:  #161b27;
+      --bg-input:     #1c2333;
+      --border:       #2a3245;
+      --border-light: #323d55;
+      --text:         #e2e8f0;
+      --text-dim:     #8892a4;
+      --text-ts:      #4a5568;
+      --accent:       #3b82f6;
+
+      /* suggestion type colors */
+      --c-answer:        #10b981;
+      --c-question:      #6366f1;
+      --c-talking-point: #f59e0b;
+      --c-fact-check:    #ef4444;
+      --c-clarify:       #06b6d4;
+
+      --radius: 8px;
+      --header-h: 48px;
+      --font: 'Inter', system-ui, sans-serif;
+    }
+
+    html, body {
+      height: 100%;
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 14px;
+      line-height: 1.5;
+      overflow: hidden;
+    }
+
+    /* ── Top bar ─────────────────────────────────────────────────────────── */
+    #topbar {
+      height: var(--header-h);
+      background: var(--bg-col);
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      align-items: center;
+      padding: 0 16px;
+      gap: 12px;
+      position: fixed;
+      top: 0; left: 0; right: 0;
+      z-index: 100;
+    }
+
+    #topbar h1 {
+      font-size: 13px;
+      font-weight: 600;
+      letter-spacing: 0.08em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+      flex: 1;
+    }
+
+    .topbar-btn {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 5px 12px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      letter-spacing: 0.04em;
+      transition: border-color 0.15s, color 0.15s;
+    }
+    .topbar-btn:hover { border-color: var(--border-light); color: var(--text); }
+
+    /* ── Layout ──────────────────────────────────────────────────────────── */
+    #layout {
+      display: grid;
+      grid-template-columns: 1fr 1fr 1fr;
+      height: calc(100vh - var(--header-h));
+      margin-top: var(--header-h);
+      gap: 0;
+    }
+
+    .col {
+      background: var(--bg-col);
+      border-right: 1px solid var(--border);
+      display: flex;
+      flex-direction: column;
+      overflow: hidden;
+    }
+    .col:last-child { border-right: none; }
+
+    /* ── Column header ───────────────────────────────────────────────────── */
+    .col-header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 0 16px;
+      height: 44px;
+      border-bottom: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    .col-title {
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    .col-badge {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      color: var(--text-dim);
+      text-transform: uppercase;
+    }
+
+    /* ── Instruction box ─────────────────────────────────────────────────── */
+    .info-box {
+      margin: 12px;
+      padding: 12px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      font-size: 12.5px;
+      color: var(--text-dim);
+      line-height: 1.6;
+      flex-shrink: 0;
+    }
+
+    .info-box b { color: var(--text); }
+    .info-box .hl-q  { color: var(--c-question); }
+    .info-box .hl-tp { color: var(--c-talking-point); }
+    .info-box .hl-a  { color: var(--c-answer); }
+    .info-box .hl-fc { color: var(--c-fact-check); }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       COL 1 — MIC & TRANSCRIPT
+    ═══════════════════════════════════════════════════════════════════════ */
+    #mic-row {
+      display: flex;
+      align-items: center;
+      gap: 12px;
+      padding: 12px 16px 0;
+      flex-shrink: 0;
+    }
+
+    #mic-btn {
+      width: 44px;
+      height: 44px;
+      border-radius: 50%;
+      border: none;
+      background: var(--accent);
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+      transition: background 0.2s, transform 0.1s, box-shadow 0.2s;
+      position: relative;
+    }
+
+    #mic-btn:hover { transform: scale(1.05); }
+    #mic-btn:active { transform: scale(0.96); }
+
+    /* Pulsing ring when recording */
+    #mic-btn.recording {
+      background: #ef4444;
+      box-shadow: 0 0 0 0 rgba(239, 68, 68, 0.5);
+      animation: pulse-ring 1.4s ease-out infinite;
+    }
+
+    @keyframes pulse-ring {
+      0%   { box-shadow: 0 0 0 0   rgba(239, 68, 68, 0.5); }
+      70%  { box-shadow: 0 0 0 12px rgba(239, 68, 68, 0);   }
+      100% { box-shadow: 0 0 0 0   rgba(239, 68, 68, 0);   }
+    }
+
+    #mic-btn svg { pointer-events: none; }
+
+    #mic-status {
+      font-size: 13px;
+      color: var(--text-dim);
+    }
+
+    #transcript-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 10px 16px 16px;
+    }
+
+    .transcript-line {
+      padding: 3px 0;
+      font-size: 13.5px;
+      line-height: 1.55;
+      color: var(--text);
+      border-bottom: 1px solid transparent;
+    }
+
+    .transcript-line .ts {
+      font-size: 11px;
+      color: var(--text-ts);
+      margin-right: 8px;
+      font-variant-numeric: tabular-nums;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       COL 2 — LIVE SUGGESTIONS
+    ═══════════════════════════════════════════════════════════════════════ */
+    #suggest-toolbar {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      padding: 8px 12px;
+      flex-shrink: 0;
+    }
+
+    #reload-btn {
+      display: flex;
+      align-items: center;
+      gap: 6px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      color: var(--text);
+      padding: 5px 12px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 12px;
+      font-weight: 500;
+      transition: border-color 0.15s, opacity 0.2s;
+    }
+    #reload-btn:hover { border-color: var(--border-light); }
+    #reload-btn.loading { opacity: 0.55; pointer-events: none; }
+    #reload-btn.loading .reload-icon { animation: spin 0.8s linear infinite; }
+
+    @keyframes spin { to { transform: rotate(360deg); } }
+
+    .reload-icon { display: inline-block; font-style: normal; }
+
+    #countdown {
+      font-size: 11px;
+      color: var(--text-dim);
+      font-variant-numeric: tabular-nums;
+    }
+
+    #suggestions-list {
+      flex: 1;
+      overflow-y: auto;
+      padding: 0 12px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 0;
+    }
+
+    /* Suggestion card */
+    .suggestion-card {
+      margin-bottom: 8px;
+      padding: 12px 14px;
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      cursor: pointer;
+      transition: border-color 0.15s, background 0.15s, transform 0.1s;
+    }
+    .suggestion-card:hover {
+      border-color: var(--border-light);
+      background: #212b3f;
+      transform: translateY(-1px);
+    }
+    .suggestion-card:active { transform: translateY(0); }
+
+    .suggestion-card.old-batch {
+      opacity: 0.55;
+    }
+
+    .suggestion-type {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      margin-bottom: 6px;
+      padding: 2px 7px;
+      border-radius: 4px;
+      display: inline-block;
+    }
+
+    /* Type color coding */
+    .type-answer        .suggestion-type { color: var(--c-answer);        background: rgba(16,185,129,0.12); }
+    .type-question-to-ask .suggestion-type,
+    .type-question      .suggestion-type { color: var(--c-question);      background: rgba(99,102,241,0.12); }
+    .type-talking-point .suggestion-type { color: var(--c-talking-point); background: rgba(245,158,11,0.12); }
+    .type-fact-check    .suggestion-type { color: var(--c-fact-check);    background: rgba(239,68,68,0.12);  }
+    .type-clarify       .suggestion-type { color: var(--c-clarify);       background: rgba(6,182,212,0.12);  }
+
+    /* Left border accent */
+    .type-answer        { border-left: 3px solid var(--c-answer);        }
+    .type-question-to-ask,
+    .type-question      { border-left: 3px solid var(--c-question);      }
+    .type-talking-point { border-left: 3px solid var(--c-talking-point); }
+    .type-fact-check    { border-left: 3px solid var(--c-fact-check);    }
+    .type-clarify       { border-left: 3px solid var(--c-clarify);       }
+
+    .suggestion-preview {
+      font-size: 13.5px;
+      font-weight: 500;
+      color: var(--text);
+      line-height: 1.5;
+    }
+
+    .batch-divider {
+      text-align: center;
+      font-size: 10.5px;
+      color: var(--text-ts);
+      letter-spacing: 0.06em;
+      padding: 10px 0 6px;
+    }
+
+    /* ═══════════════════════════════════════════════════════════════════════
+       COL 3 — CHAT
+    ═══════════════════════════════════════════════════════════════════════ */
+    #chat-messages {
+      flex: 1;
+      overflow-y: auto;
+      padding: 8px 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+
+    .chat-message { display: flex; flex-direction: column; gap: 4px; }
+
+    .chat-label {
+      font-size: 10px;
+      font-weight: 700;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      color: var(--text-ts);
+    }
+
+    .chat-bubble {
+      background: var(--bg-card);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      padding: 10px 13px;
+      font-size: 13.5px;
+      line-height: 1.6;
+      color: var(--text);
+      white-space: pre-wrap;
+      word-break: break-word;
+    }
+
+    .chat-bubble.streaming::after {
+      content: "▋";
+      animation: blink 0.8s step-end infinite;
+      color: var(--accent);
+      margin-left: 2px;
+    }
+    @keyframes blink { 0%,100%{opacity:1} 50%{opacity:0} }
+
+    .chat-bubble.error { border-color: var(--c-fact-check); color: var(--c-fact-check); }
+
+    /* Chat input bar */
+    #chat-input-row {
+      display: flex;
+      gap: 8px;
+      padding: 10px 12px;
+      border-top: 1px solid var(--border);
+      flex-shrink: 0;
+    }
+
+    #chat-input {
+      flex: 1;
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 13.5px;
+      padding: 8px 12px;
+      outline: none;
+      font-family: var(--font);
+      transition: border-color 0.15s;
+    }
+    #chat-input::placeholder { color: var(--text-ts); }
+    #chat-input:focus { border-color: var(--accent); }
+
+    #chat-send {
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      padding: 8px 16px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+      transition: background 0.15s, opacity 0.2s;
+    }
+    #chat-send:hover { background: #2563eb; }
+    #chat-send:disabled { opacity: 0.5; cursor: not-allowed; }
+
+    /* ── Scrollbars ──────────────────────────────────────────────────────── */
+    ::-webkit-scrollbar { width: 5px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: var(--border-light); border-radius: 99px; }
+
+    /* ── Error toast ─────────────────────────────────────────────────────── */
+    #error-toast {
+      position: fixed;
+      bottom: 20px;
+      left: 50%;
+      transform: translateX(-50%) translateY(80px);
+      background: #2d1f1f;
+      border: 1px solid var(--c-fact-check);
+      color: #fca5a5;
+      padding: 10px 18px;
+      border-radius: var(--radius);
+      font-size: 13px;
+      z-index: 999;
+      transition: transform 0.25s ease;
+      pointer-events: none;
+      white-space: nowrap;
+    }
+    #error-toast.visible { transform: translateX(-50%) translateY(0); }
+
+    /* ── Settings modal ──────────────────────────────────────────────────── */
+    #settings-modal {
+      display: none;
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      z-index: 200;
+      align-items: center;
+      justify-content: center;
+    }
+    #settings-modal.open { display: flex; }
+
+    #settings-panel {
+      background: var(--bg-col);
+      border: 1px solid var(--border-light);
+      border-radius: 12px;
+      width: 560px;
+      max-width: 95vw;
+      max-height: 90vh;
+      overflow-y: auto;
+      padding: 24px;
+      display: flex;
+      flex-direction: column;
+      gap: 16px;
+    }
+
+    #settings-panel h2 {
+      font-size: 14px;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text);
+    }
+
+    .settings-group { display: flex; flex-direction: column; gap: 6px; }
+
+    .settings-group label {
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-dim);
+    }
+
+    .settings-group input,
+    .settings-group textarea,
+    .settings-group select {
+      background: var(--bg-input);
+      border: 1px solid var(--border);
+      border-radius: var(--radius);
+      color: var(--text);
+      font-size: 13px;
+      padding: 8px 10px;
+      font-family: var(--font);
+      outline: none;
+      transition: border-color 0.15s;
+    }
+    .settings-group input:focus,
+    .settings-group textarea:focus { border-color: var(--accent); }
+    .settings-group textarea { min-height: 90px; resize: vertical; }
+
+    .settings-row { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+
+    .settings-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+    .btn-ghost {
+      background: transparent;
+      border: 1px solid var(--border);
+      color: var(--text-dim);
+      padding: 7px 16px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 13px;
+    }
+    .btn-primary {
+      background: var(--accent);
+      border: none;
+      color: #fff;
+      padding: 7px 20px;
+      border-radius: var(--radius);
+      cursor: pointer;
+      font-size: 13px;
+      font-weight: 600;
+    }
+  </style>
+</head>
+<body>
+
+<!-- ── Top bar ──────────────────────────────────────────────────────────────── -->
+<div id="topbar">
+  <h1>Live Meeting Assistant</h1>
+  <button class="topbar-btn" id="export-btn">⬇ Export session</button>
+  <button class="topbar-btn" id="settings-btn">⚙ Settings</button>
+</div>
+
+<!-- ── 3-column layout ──────────────────────────────────────────────────────── -->
+<div id="layout">
+
+  <!-- ── COL 1: MIC & TRANSCRIPT ─────────────────────────────────────────── -->
+  <div class="col" id="col-transcript">
+    <div class="col-header">
+      <span class="col-title">1. Mic &amp; Transcript</span>
+      <span class="col-badge" id="mic-col-badge">IDLE</span>
+    </div>
+
+    <div id="mic-row">
+      <button id="mic-btn" aria-label="Start recording">
+        <!-- Mic icon -->
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/>
+          <path d="M19 10v2a7 7 0 0 1-14 0v-2"/>
+          <line x1="12" y1="19" x2="12" y2="23"/>
+          <line x1="8"  y1="23" x2="16" y2="23"/>
+        </svg>
+      </button>
+      <span id="mic-status">Click to start recording.</span>
+    </div>
+
+    <div class="info-box">
+      The transcript scrolls and appends new chunks every ~30 seconds while recording.
+      Use the mic button to start/stop. Use <b>⬇ Export session</b> (top bar) to download
+      the full transcript, suggestion batches, and chat history as JSON.
+    </div>
+
+    <div id="transcript-list"></div>
+  </div>
+
+  <!-- ── COL 2: LIVE SUGGESTIONS ──────────────────────────────────────────── -->
+  <div class="col" id="col-suggestions">
+    <div class="col-header">
+      <span class="col-title">2. Live Suggestions</span>
+      <span class="col-badge" id="batch-count">0 BATCHES</span>
+    </div>
+
+    <div id="suggest-toolbar">
+      <button id="reload-btn">
+        <span class="reload-icon">↺</span> Reload suggestions
+      </button>
+      <span id="countdown"></span>
+    </div>
+
+    <div class="info-box">
+      On reload (or auto every ~30s), generates <b>3 fresh suggestions</b> from recent
+      transcript context. New batch appears at the top; older batches push down (faded).
+      Each is a tappable card: a <span class="hl-q">question to ask</span>,
+      a <span class="hl-tp">talking point</span>,
+      an <span class="hl-a">answer</span>,
+      or a <span class="hl-fc">fact-check</span>.
+      The preview alone should already be useful.
+    </div>
+
+    <div id="suggestions-list"></div>
+  </div>
+
+  <!-- ── COL 3: CHAT ───────────────────────────────────────────────────────── -->
+  <div class="col" id="col-chat">
+    <div class="col-header">
+      <span class="col-title">3. Chat (Detailed Answers)</span>
+      <span class="col-badge">SESSION-ONLY</span>
+    </div>
+
+    <div class="info-box">
+      Clicking a suggestion adds it to this chat and streams a detailed answer
+      (separate prompt, more context). You can also type questions directly.
+      One continuous chat per session — no login, no persistence.
+    </div>
+
+    <div id="chat-messages"></div>
+
+    <div id="chat-input-row">
+      <input id="chat-input" type="text" placeholder="Ask anything…" autocomplete="off" />
+      <button id="chat-send">Send</button>
+    </div>
+  </div>
+
+</div>
+
+<!-- ── Error toast ───────────────────────────────────────────────────────────── -->
+<div id="error-toast"></div>
+
+<!-- ── Settings modal ───────────────────────────────────────────────────────── -->
+<div id="settings-modal">
+  <div id="settings-panel">
+    <h2>⚙ Settings</h2>
+
+    <div class="settings-group">
+      <label>Groq API Key</label>
+      <input id="settings-api-key" type="password" placeholder="gsk_…" />
+    </div>
+
+    <div class="settings-row">
+      <div class="settings-group">
+        <label>Suggestion Model</label>
+        <input id="s-suggestion-model" type="text" value="openai/gpt-oss-120b" />
+      </div>
+      <div class="settings-group">
+        <label>Chat Model</label>
+        <input id="s-chat-model" type="text" value="openai/gpt-oss-120b" />
+      </div>
+    </div>
+
+    <div class="settings-row">
+      <div class="settings-group">
+        <label>Suggestion Context (lines)</label>
+        <input id="s-suggestion-ctx" type="number" value="60" min="10" max="300" />
+      </div>
+      <div class="settings-group">
+        <label>Chat Context (lines)</label>
+        <input id="s-chat-ctx" type="number" value="120" min="10" max="500" />
+      </div>
+    </div>
+
+    <div class="settings-group">
+      <label>Suggestion System Prompt (leave blank for default)</label>
+      <textarea id="s-suggestion-prompt" placeholder="Leave blank to use the optimised default…"></textarea>
+    </div>
+
+    <div class="settings-group">
+      <label>Chat System Prompt (leave blank for default)</label>
+      <textarea id="s-chat-prompt" placeholder="Leave blank to use the optimised default…"></textarea>
+    </div>
+
+    <div class="settings-actions">
+      <button class="btn-ghost" id="settings-close">Cancel</button>
+      <button class="btn-primary" id="settings-save">Save</button>
+    </div>
+  </div>
+</div>
+
+<script type="module" src="app.js"></script>
+</body>
+</html>
