@@ -7,7 +7,7 @@ import os
 from pathlib import Path
 
 from dotenv import load_dotenv
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
@@ -70,6 +70,12 @@ app.add_middleware(
 
 # ── API routes ────────────────────────────────────────────────────────────────
 app.include_router(router)
+
+
+@app.get("/favicon.ico", include_in_schema=False)
+async def favicon():
+    # Avoid noisy 404 logs when browsers auto-request a favicon.
+    return Response(status_code=204)
 
 # ── Serve frontend static files ───────────────────────────────────────────────
 frontend_dir = Path(__file__).parent.parent / "frontend"

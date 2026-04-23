@@ -33,7 +33,6 @@ const AUTO_REFRESH_INTERVAL = 30; // seconds
 const MAX_TRANSCRIPT_LINES_FOR_SUGGEST = 60;
 const MAX_PREV_BATCHES_FOR_SUGGEST = 6;
 const MAX_TRANSCRIPT_LINES_FOR_CHAT = 60;
-const MAX_API_MESSAGES_FOR_CHAT = 6;
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const micBtn         = document.getElementById("mic-btn");
@@ -382,7 +381,15 @@ async function sendChatMessage(apiContent, displayText) {
   isChatLoading = true;
   chatSendBtn.disabled = true;
 
-  apiMessages.push({ role: "user", content: apiContent });
+  const titleText = String(displayText || "").replace(/"/g, '\\"').trim();
+  const requestPayload =
+    `Current user text: "${titleText}"\n\n` +
+    `${apiContent}\n\n` +
+    `Formatting rule: start with exactly:\n` +
+    `Detailed answer to: "${titleText}"\n\n` +
+    `Leave one blank line after that header, then continue with the answer.`;
+
+  apiMessages.push({ role: "user", content: requestPayload });
 
   const bubble = appendChatBubble("assistant", "Thinking...");
   bubble.classList.add("streaming");
@@ -399,7 +406,7 @@ async function sendChatMessage(apiContent, displayText) {
     const lines = transcriptLines
       .slice(-MAX_TRANSCRIPT_LINES_FOR_CHAT)
       .map((l) => `${l.ts} ${l.text}`);
-    const messagesForApi = apiMessages.slice(-MAX_API_MESSAGES_FOR_CHAT);
+    const messagesForApi = apiMessages;
 
     await streamChat(messagesForApi, lines, apiKey, (delta) => {
       fullResponse += delta;
