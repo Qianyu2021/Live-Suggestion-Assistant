@@ -30,6 +30,10 @@ let apiKey   = localStorage.getItem("groq_api_key") || "";
 let settings = JSON.parse(localStorage.getItem("app_settings") || "{}");
 
 const AUTO_REFRESH_INTERVAL = 30; // seconds
+const MAX_TRANSCRIPT_LINES_FOR_SUGGEST = 60;
+const MAX_PREV_BATCHES_FOR_SUGGEST = 6;
+const MAX_TRANSCRIPT_LINES_FOR_CHAT = 60;
+const MAX_API_MESSAGES_FOR_CHAT = 6;
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const micBtn         = document.getElementById("mic-btn");
@@ -51,13 +55,41 @@ const settingsClose  = document.getElementById("settings-close");
 const settingsSave   = document.getElementById("settings-save");
 const apiKeyInput    = document.getElementById("settings-api-key");
 
+function shouldAppendTranscript(text) {
+  const trimmed = String(text || "").trim();
+  if (!trimmed) return false;
+
+  const normalized = trimmed
+    .toLowerCase()
+    .replace(/[^a-z0-9\s]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+
+  if (!normalized || !/[a-z0-9]/.test(normalized)) return false;
+
+  const silenceHallucinations = new Set([
+    "thank you",
+    "thanks",
+    "thank you for watching",
+    "thanks for watching",
+    "see you next time",
+    "bye",
+    "goodbye",
+    "you",
+  ]);
+  if (silenceHallucinations.has(normalized)) return false;
+  if (normalized.startsWith("thank you for watching")) return false;
+
+  return true;
+}
+
 // ── AudioRecorder ─────────────────────────────────────────────────────────────
 const recorder = new AudioRecorder(async (blob, mimeType) => {
   if (!apiKey) return showError("Set your Groq API key in ⚙ Settings first.");
   pendingTranscribes++;
   try {
     const text = await transcribeAudio(blob, mimeType, apiKey);
-    if (text) appendTranscriptLine(text);
+    if (shouldAppendTranscript(text)) appendTranscriptLine(text);
   } catch (e) {
     showError("Transcription error: " + e.message);
   } finally {
@@ -100,6 +132,7 @@ micBtn.addEventListener("click", async () => {
     micColBadge.textContent = "IDLE";
     micColBadge.style.color = "";
     stopAutoRefresh();
+    refreshSuggestionsOnStop();
   }
 });
 
@@ -161,10 +194,22 @@ function updateCountdown() {
  *  • Skips silently if no transcript yet, or if no new lines since the
  *    last batch (no point burning a Groq call on identical input).
  */
-function requestSuggestionsRefresh() {
+function requestSuggestionsRefresh(force = false) {
   if (transcriptLines.length === 0) return;
-  if (transcriptLines.length === lastSuggestedLineCount) return;
+  if (!force && transcriptLines.length === lastSuggestedLineCount) return;
 
+  if (!force && pendingTranscribes > 0) {
+    suggestPending = true;
+    return;
+  }
+  runSuggestions();
+}
+
+function refreshSuggestionsOnStop() {
+  if (transcriptLines.length === 0) return;
+  // Force a new batch on stop even if <30s since last auto-refresh.
+  lastSuggestedLineCount = -1;
+  // Wait for final in-flight transcript chunk so suggestions use freshest text.
   if (pendingTranscribes > 0) {
     suggestPending = true;
     return;
@@ -178,7 +223,7 @@ reloadBtn.addEventListener("click", () => {
   updateCountdown();
   // Force a refresh even if line count hasn't changed (user explicitly asked)
   lastSuggestedLineCount = -1;
-  requestSuggestionsRefresh();
+  requestSuggestionsRefresh(true);
 });
 
 // ── Suggestions ───────────────────────────────────────────────────────────────
@@ -191,8 +236,12 @@ async function runSuggestions() {
   const snapshotCount = transcriptLines.length;
 
   try {
-    const lines = transcriptLines.map((l) => `${l.ts} ${l.text}`);
-    const prevBatches = suggestionBatches.map((b) => b.suggestions);
+    const lines = transcriptLines
+      .slice(-MAX_TRANSCRIPT_LINES_FOR_SUGGEST)
+      .map((l) => `${l.ts} ${l.text}`);
+    const prevBatches = suggestionBatches
+      .slice(0, MAX_PREV_BATCHES_FOR_SUGGEST)
+      .map((b) => b.suggestions);
     const suggestions = await fetchSuggestions(lines, prevBatches, apiKey, settings);
 
     const batch = { ts: nowTime(), suggestions };
@@ -272,14 +321,13 @@ async function handleSuggestionClick(suggestion) {
   appendChatBubble("user", userContent, suggestion.type);
 
   const expandedPrompt =
-    `The user selected a "${formatType(suggestion.type)}" suggestion from the live feed.\n\n` +
-    `Suggestion shown: "${suggestion.preview}"\n\n` +
-    `Context hint: ${suggestion.detail_hint}\n\n` +
-    `Respond using this exact structure:\n` +
-    `Detailed answer to: "${suggestion.preview}"\n\n` +
-    `Then provide 2-4 concise paragraphs with specific details grounded in the transcript.\n` +
-    `End with: Follow-up suggestion: <one actionable next line to say or ask>.\n\n` +
-    `Be specific, cite numbers or named systems when relevant, and keep it actionable.`;
+    `Card type: ${formatType(suggestion.type)}\n` +
+    `Card: "${suggestion.preview}"\n` +
+    `Hint: ${suggestion.detail_hint}\n\n` +
+    `Write:\n` +
+    `Detailed answer to: "${suggestion.preview}"\n` +
+    `Then 2-4 short, specific paragraphs grounded in the transcript.\n` +
+    `End with: Follow-up suggestion: <one actionable next line>.`;
 
   await sendChatMessage(expandedPrompt, userContent);
 }
@@ -336,21 +384,34 @@ async function sendChatMessage(apiContent, displayText) {
 
   apiMessages.push({ role: "user", content: apiContent });
 
-  const bubble = appendChatBubble("assistant", "");
+  const bubble = appendChatBubble("assistant", "Thinking...");
   bubble.classList.add("streaming");
 
   let fullResponse = "";
+  let renderQueued = false;
+  const renderStream = () => {
+    renderQueued = false;
+    bubble.innerHTML = escHtml(fullResponse).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>");
+    chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+  };
 
   try {
-    const lines = transcriptLines.map((l) => `${l.ts} ${l.text}`);
+    const lines = transcriptLines
+      .slice(-MAX_TRANSCRIPT_LINES_FOR_CHAT)
+      .map((l) => `${l.ts} ${l.text}`);
+    const messagesForApi = apiMessages.slice(-MAX_API_MESSAGES_FOR_CHAT);
 
-    await streamChat(apiMessages, lines, apiKey, (delta) => {
+    await streamChat(messagesForApi, lines, apiKey, (delta) => {
       fullResponse += delta;
-      bubble.innerHTML = escHtml(fullResponse).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>");
-      chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
+      if (!renderQueued) {
+        renderQueued = true;
+        requestAnimationFrame(renderStream);
+      }
     }, settings);
 
+    if (renderQueued) renderStream();
     bubble.classList.remove("streaming");
+    if (!fullResponse.trim()) bubble.textContent = "No response received.";
     apiMessages.push({ role: "assistant", content: fullResponse });
     chatHistory[chatHistory.length - 1].content = fullResponse;
 

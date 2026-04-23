@@ -40,7 +40,44 @@ async def transcribe_audio(
         response_format="verbose_json",
         language="en",
     )
-    return (response.text or "").strip()
+    text = (response.text or "").strip()
+    if not text:
+        return ""
+
+    # Guard 1: suppress likely silence from Whisper segment metadata.
+    segments = getattr(response, "segments", None)
+    no_speech_probs: list[float] = []
+    if segments:
+        for seg in segments:
+            p = getattr(seg, "no_speech_prob", None)
+            if isinstance(p, (int, float)):
+                no_speech_probs.append(float(p))
+    if no_speech_probs:
+        avg_no_speech = sum(no_speech_probs) / len(no_speech_probs)
+        if avg_no_speech >= 0.82:
+            return ""
+        if avg_no_speech >= 0.65 and len(text) <= 48:
+            return ""
+
+    # Guard 2: suppress common silence hallucinations.
+    normalized = re.sub(r"[^a-z0-9\s]", " ", text.lower())
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    silence_hallucinations = {
+        "thank you",
+        "thanks",
+        "thank you for watching",
+        "thanks for watching",
+        "see you next time",
+        "bye",
+        "goodbye",
+        "you",
+    }
+    if normalized in silence_hallucinations:
+        return ""
+    if normalized.startswith("thank you for watching"):
+        return ""
+
+    return text
  
  
 async def generate_suggestions(
@@ -194,7 +231,7 @@ async def stream_chat_completion(
     """
     stream = await client.chat.completions.create(
         model=model,
-        max_tokens=1024,
+        max_tokens=512,
         temperature=0.5,
         stream=True,
         messages=[

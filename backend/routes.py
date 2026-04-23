@@ -264,24 +264,7 @@ async def suggest(req: SuggestRequest):
 
         suggestions = _extract_unique_suggestions(result, previous_preview_keys)
 
-        # If model returned fewer than 3, ask once more for only the missing cards.
-        if len(suggestions) < 3:
-            missing = 3 - len(suggestions)
-            avoid = "\n".join(f"- {s['preview']}" for s in suggestions)
-            retry_prompt = (
-                f"{user_prompt}\n\n"
-                f"You must return exactly {missing} additional suggestions only.\n"
-                "Do not repeat any preview from previous suggestions or this avoid-list:\n"
-                f"{avoid if avoid else '(none)'}"
-            )
-            retry = await generate_suggestions(client, system_prompt, retry_prompt, cfg.suggestion_model)
-            retry_cards = _extract_unique_suggestions(
-                retry,
-                previous_preview_keys | {s['preview'].strip().lower() for s in suggestions},
-            )
-            suggestions.extend(retry_cards)
-
-        # Deterministic fallback: always return exactly 3 cards.
+        # Fast path: skip an extra model round-trip; fill missing cards locally.
         if len(suggestions) < 3:
             blocked = previous_preview_keys | {s['preview'].strip().lower() for s in suggestions}
             suggestions.extend(_fallback_suggestions(new_lines, blocked, 3 - len(suggestions)))

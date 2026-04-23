@@ -22,9 +22,14 @@ export class AudioRecorder {
     this._onChunkReady  = onChunkReady;
     this._stream        = null;
     this._recorder      = null;
-    this._chunks        = [];      // accumulate data for current segment
+    this._activeSegment = null;    // per-segment buffer + VAD stats
     this._cycleTimer    = null;    // fires every 30s to rotate the recorder
     this._stopping      = false;   // true while stop() is in progress
+    this._audioCtx      = null;
+    this._sourceNode    = null;
+    this._analyser      = null;
+    this._vadBuffer     = null;
+    this._vadRaf        = null;
     this.isRecording    = false;
   }
 
@@ -44,6 +49,7 @@ export class AudioRecorder {
 
     this._stopping   = false;
     this.isRecording = true;
+    this._startVad();
 
     this._startSegment();
 
@@ -63,28 +69,29 @@ export class AudioRecorder {
     // Stopping the recorder fires one final dataavailable with any remaining
     // audio. Our handler will dispatch it if it's non-empty.
     this._recorder?.stop();
+    this._stopVad();
   }
 
   // ── Private ─────────────────────────────────────────────────────────────────
 
   _startSegment() {
     const mimeType = this._pickMimeType();
-    this._chunks   = [];
+    const segment  = { chunks: [], voiceFrames: 0, hadVoice: false };
+    this._activeSegment = segment;
     this._recorder = new MediaRecorder(this._stream, mimeType ? { mimeType } : {});
     this._mimeType = this._recorder.mimeType; // resolved actual mime type
 
     this._recorder.addEventListener("dataavailable", (e) => {
-      if (e.data && e.data.size > 0) this._chunks.push(e.data);
+      if (e.data && e.data.size > 0) segment.chunks.push(e.data);
     });
 
     this._recorder.addEventListener("stop", () => {
-      if (this._chunks.length === 0) return;
+      if (segment.chunks.length === 0) return;
 
-      const blob = new Blob(this._chunks, { type: this._mimeType });
-      this._chunks = [];
+      const blob = new Blob(segment.chunks, { type: this._mimeType });
 
-      // Only dispatch if we have meaningful audio (>1KB avoids silence-only chunks)
-      if (blob.size > 1024) {
+      // Dispatch only when we have enough bytes and detected speech activity.
+      if (blob.size > 1024 && segment.hadVoice) {
         this._onChunkReady(blob, this._mimeType);
       }
     });
@@ -108,5 +115,68 @@ export class AudioRecorder {
       "audio/mp4",
     ];
     return candidates.find((m) => MediaRecorder.isTypeSupported(m)) || "";
+  }
+
+  _startVad() {
+    if (!this._stream) return;
+
+    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+    if (!AudioCtx) return;
+
+    this._audioCtx = new AudioCtx();
+    this._sourceNode = this._audioCtx.createMediaStreamSource(this._stream);
+    this._analyser = this._audioCtx.createAnalyser();
+    this._analyser.fftSize = 2048;
+    this._analyser.smoothingTimeConstant = 0.2;
+    this._vadBuffer = new Float32Array(this._analyser.fftSize);
+    this._sourceNode.connect(this._analyser);
+
+    const SPEECH_RMS_THRESHOLD = 0.01;
+    const MIN_VOICE_FRAMES = 3;
+
+    const tick = () => {
+      if (!this.isRecording || !this._analyser || !this._activeSegment) return;
+
+      this._analyser.getFloatTimeDomainData(this._vadBuffer);
+      let sum = 0;
+      for (let i = 0; i < this._vadBuffer.length; i++) {
+        const v = this._vadBuffer[i];
+        sum += v * v;
+      }
+      const rms = Math.sqrt(sum / this._vadBuffer.length);
+
+      if (rms > SPEECH_RMS_THRESHOLD) {
+        this._activeSegment.voiceFrames += 1;
+        if (this._activeSegment.voiceFrames >= MIN_VOICE_FRAMES) {
+          this._activeSegment.hadVoice = true;
+        }
+      }
+
+      this._vadRaf = requestAnimationFrame(tick);
+    };
+
+    this._vadRaf = requestAnimationFrame(tick);
+  }
+
+  _stopVad() {
+    if (this._vadRaf) {
+      cancelAnimationFrame(this._vadRaf);
+      this._vadRaf = null;
+    }
+
+    if (this._sourceNode) {
+      this._sourceNode.disconnect();
+      this._sourceNode = null;
+    }
+    if (this._analyser) {
+      this._analyser.disconnect();
+      this._analyser = null;
+    }
+    this._vadBuffer = null;
+
+    if (this._audioCtx) {
+      this._audioCtx.close().catch(() => {});
+      this._audioCtx = null;
+    }
   }
 }

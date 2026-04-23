@@ -14,12 +14,12 @@ class Settings:
     chat_model:          str = "llama-3.3-70b-versatile"
 
     # ── Context windows ───────────────────────────────────────────────────────
-    suggestion_context_lines: int = 60
-    suggestion_new_lines:     int = 10
+    suggestion_context_lines: int = 45
+    suggestion_new_lines:     int = 8
     suggestion_candidate_count: int = 3
-    chat_context_lines:       int = 120
-    chat_history_messages:    int = 12
-    chat_history_chars:       int = 12000
+    chat_context_lines:       int = 80
+    chat_history_messages:    int = 8
+    chat_history_chars:       int = 8000
 
     # ── Suggestion prompt ─────────────────────────────────────────────────────
     suggestion_system_prompt: str = """You are a real-time meeting copilot generating live suggestion cards.
