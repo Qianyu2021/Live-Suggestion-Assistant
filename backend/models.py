@@ -11,11 +11,17 @@ from pydantic import BaseModel
 class SettingsOverride(BaseModel):
     """Optional per-request overrides for prompts and model settings."""
     suggestion_model: Optional[str] = None
+    suggestion_judge_model: Optional[str] = None
     chat_model: Optional[str] = None
     suggestion_context_lines: Optional[int] = None
+    suggestion_new_lines: Optional[int] = None
+    suggestion_candidate_count: Optional[int] = None
     chat_context_lines: Optional[int] = None
+    chat_history_messages: Optional[int] = None
+    chat_history_chars: Optional[int] = None
     suggestion_system_prompt: Optional[str] = None
     suggestion_user_prompt: Optional[str] = None
+    suggestion_judge_system_prompt: Optional[str] = None
     chat_system_prompt: Optional[str] = None
     chat_context_injection: Optional[str] = None
 

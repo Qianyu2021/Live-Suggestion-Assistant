@@ -2,56 +2,71 @@
  * app.js — State machine + UI orchestration.
  *
  * State:
- *   transcriptLines[]   — all timestamped lines captured so far
- *   suggestionBatches[] — array of { ts, suggestions[] }
- *   chatHistory[]       — { ts, role, content }
+ *   transcriptLines[]   — { ts, text } all timestamped lines captured
+ *   suggestionBatches[] — { ts, suggestions[] } newest first
+ *   chatHistory[]       — { ts, role, content } for export only
+ *   apiMessages[]       — { role, content } sent to the API (no timestamps)
  *   apiKey              — from localStorage / settings panel
- *   settings            — prompt/model overrides (from settings panel)
+ *   settings            — prompt/model overrides from settings panel
  */
 
 import { AudioRecorder } from "./audio.js";
 import { transcribeAudio, fetchSuggestions, streamChat } from "./api.js";
 
 // ── State ─────────────────────────────────────────────────────────────────────
-let transcriptLines = [];       // { ts: "HH:MM:SS", text: string }
-let suggestionBatches = [];     // { ts: string, suggestions: [] }
-let chatHistory = [];           // { ts, role, content }
-let isRecording = false;
-let isSuggestLoading = false;
-let isChatLoading = false;
-let autoRefreshTimer = null;
+let transcriptLines    = [];   // { ts, text }
+let suggestionBatches  = [];   // { ts, suggestions[] } — newest at index 0
+let chatHistory        = [];   // { ts, role, content } — for export
+let apiMessages        = [];   // { role, content }     — sent to LLM
+let isRecording        = false;
+let isSuggestLoading   = false;
+let isChatLoading      = false;
+let pendingTranscribes = 0;    // # of in-flight transcribe requests
+let suggestPending     = false;// a refresh was requested but had to wait
+let autoRefreshTimer   = null;
 let autoRefreshCountdown = 30;
-let apiKey = localStorage.getItem("groq_api_key") || "";
+let lastSuggestedLineCount = 0; // how many transcript lines existed at last batch
+let apiKey   = localStorage.getItem("groq_api_key") || "";
 let settings = JSON.parse(localStorage.getItem("app_settings") || "{}");
 
 const AUTO_REFRESH_INTERVAL = 30; // seconds
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
-const micBtn          = document.getElementById("mic-btn");
-const micStatus       = document.getElementById("mic-status");
-const transcriptEl    = document.getElementById("transcript-list");
-const suggestionsEl   = document.getElementById("suggestions-list");
-const batchCountEl    = document.getElementById("batch-count");
-const reloadBtn       = document.getElementById("reload-btn");
-const countdownEl     = document.getElementById("countdown");
-const chatMessagesEl  = document.getElementById("chat-messages");
-const chatInput       = document.getElementById("chat-input");
-const chatSendBtn     = document.getElementById("chat-send");
-const exportBtn       = document.getElementById("export-btn");
-const settingsBtn     = document.getElementById("settings-btn");
-const settingsModal   = document.getElementById("settings-modal");
-const settingsClose   = document.getElementById("settings-close");
-const settingsSave    = document.getElementById("settings-save");
-const apiKeyInput     = document.getElementById("settings-api-key");
+const micBtn         = document.getElementById("mic-btn");
+const micStatus      = document.getElementById("mic-status");
+const micColBadge    = document.getElementById("mic-col-badge");
+const transcriptEl   = document.getElementById("transcript-list");
+const suggestionsEl  = document.getElementById("suggestions-list");
+const batchCountEl   = document.getElementById("batch-count");
+const reloadBtn      = document.getElementById("reload-btn");
+const countdownEl    = document.getElementById("countdown");
+const chatMessagesEl = document.getElementById("chat-messages");
+const transcriptHint = document.getElementById("transcript-hint");
+const chatInput      = document.getElementById("chat-input");
+const chatSendBtn    = document.getElementById("chat-send");
+const exportBtn      = document.getElementById("export-btn");
+const settingsBtn    = document.getElementById("settings-btn");
+const settingsModal  = document.getElementById("settings-modal");
+const settingsClose  = document.getElementById("settings-close");
+const settingsSave   = document.getElementById("settings-save");
+const apiKeyInput    = document.getElementById("settings-api-key");
 
 // ── AudioRecorder ─────────────────────────────────────────────────────────────
 const recorder = new AudioRecorder(async (blob, mimeType) => {
   if (!apiKey) return showError("Set your Groq API key in ⚙ Settings first.");
+  pendingTranscribes++;
   try {
     const text = await transcribeAudio(blob, mimeType, apiKey);
     if (text) appendTranscriptLine(text);
   } catch (e) {
     showError("Transcription error: " + e.message);
+  } finally {
+    pendingTranscribes--;
+    // If a refresh was waiting on transcription to land, kick it off now.
+    if (suggestPending && pendingTranscribes === 0) {
+      suggestPending = false;
+      runSuggestions();
+    }
   }
 });
 
@@ -62,6 +77,7 @@ micBtn.addEventListener("click", async () => {
     openSettings();
     return;
   }
+
   if (!isRecording) {
     try {
       await recorder.start();
@@ -69,6 +85,8 @@ micBtn.addEventListener("click", async () => {
       micBtn.classList.add("recording");
       micBtn.setAttribute("aria-label", "Stop recording");
       micStatus.textContent = "Listening…";
+      micColBadge.textContent = "LIVE";
+      micColBadge.style.color = "#ef4444";
       startAutoRefresh();
     } catch (e) {
       showError("Mic error: " + e.message);
@@ -79,6 +97,8 @@ micBtn.addEventListener("click", async () => {
     micBtn.classList.remove("recording");
     micBtn.setAttribute("aria-label", "Start recording");
     micStatus.textContent = "Stopped. Click to resume.";
+    micColBadge.textContent = "IDLE";
+    micColBadge.style.color = "";
     stopAutoRefresh();
   }
 });
@@ -86,31 +106,43 @@ micBtn.addEventListener("click", async () => {
 // ── Transcript ────────────────────────────────────────────────────────────────
 function appendTranscriptLine(text) {
   const ts = nowTime();
+  const wasEmpty = transcriptLines.length === 0;
   transcriptLines.push({ ts, text });
+
+  // Hide the instruction hint once real transcript starts appearing
+  if (transcriptHint) transcriptHint.style.display = "none";
 
   const el = document.createElement("div");
   el.className = "transcript-line";
   el.innerHTML = `<span class="ts">${ts}</span> ${escHtml(text)}`;
   transcriptEl.appendChild(el);
   transcriptEl.scrollTop = transcriptEl.scrollHeight;
+
+  // Fire the very first batch immediately so the user gets value right away
+  // instead of waiting up to 30s for the auto-refresh tick.
+  if (wasEmpty && isRecording) {
+    runSuggestions();
+  }
 }
 
 // ── Auto-refresh ──────────────────────────────────────────────────────────────
 function startAutoRefresh() {
   autoRefreshCountdown = AUTO_REFRESH_INTERVAL;
   updateCountdown();
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
   autoRefreshTimer = setInterval(() => {
     autoRefreshCountdown--;
     updateCountdown();
     if (autoRefreshCountdown <= 0) {
       autoRefreshCountdown = AUTO_REFRESH_INTERVAL;
-      runSuggestions();
+      requestSuggestionsRefresh();
     }
   }, 1000);
 }
 
 function stopAutoRefresh() {
-  clearInterval(autoRefreshTimer);
+  if (autoRefreshTimer) clearInterval(autoRefreshTimer);
+  autoRefreshTimer = null;
   countdownEl.textContent = "";
 }
 
@@ -118,9 +150,35 @@ function updateCountdown() {
   countdownEl.textContent = `auto-refresh in ${autoRefreshCountdown}s`;
 }
 
-reloadBtn.addEventListener("click", () => {
-  autoRefreshCountdown = AUTO_REFRESH_INTERVAL;
+/**
+ * requestSuggestionsRefresh — central entry point used by both the timer
+ * tick and the manual reload button.
+ *
+ * Behaviour:
+ *  • If a transcription is mid-flight, defer until it lands (so we always
+ *    suggest against the freshest possible transcript).
+ *  • Otherwise run immediately.
+ *  • Skips silently if no transcript yet, or if no new lines since the
+ *    last batch (no point burning a Groq call on identical input).
+ */
+function requestSuggestionsRefresh() {
+  if (transcriptLines.length === 0) return;
+  if (transcriptLines.length === lastSuggestedLineCount) return;
+
+  if (pendingTranscribes > 0) {
+    suggestPending = true;
+    return;
+  }
   runSuggestions();
+}
+
+reloadBtn.addEventListener("click", () => {
+  // Manual reload: reset the auto-refresh countdown so we don't double-fire
+  autoRefreshCountdown = AUTO_REFRESH_INTERVAL;
+  updateCountdown();
+  // Force a refresh even if line count hasn't changed (user explicitly asked)
+  lastSuggestedLineCount = -1;
+  requestSuggestionsRefresh();
 });
 
 // ── Suggestions ───────────────────────────────────────────────────────────────
@@ -129,12 +187,17 @@ async function runSuggestions() {
   isSuggestLoading = true;
   reloadBtn.classList.add("loading");
 
+  // Snapshot the line count we're suggesting against
+  const snapshotCount = transcriptLines.length;
+
   try {
     const lines = transcriptLines.map((l) => `${l.ts} ${l.text}`);
     const prevBatches = suggestionBatches.map((b) => b.suggestions);
     const suggestions = await fetchSuggestions(lines, prevBatches, apiKey, settings);
+
     const batch = { ts: nowTime(), suggestions };
     suggestionBatches.unshift(batch); // newest first
+    lastSuggestedLineCount = snapshotCount;
     renderSuggestions();
     batchCountEl.textContent = `${suggestionBatches.length} BATCH${suggestionBatches.length !== 1 ? "ES" : ""}`;
   } catch (e) {
@@ -145,41 +208,27 @@ async function runSuggestions() {
   }
 }
 
+/**
+ * renderSuggestions — clean single-pass render.
+ *
+ * Layout (top → bottom):
+ *   [BATCH N cards]  ← newest, full opacity
+ *   — BATCH N · timestamp —
+ *   [BATCH N-1 cards]  ← faded
+ *   — BATCH N-1 · timestamp —
+ *   ...
+ */
 function renderSuggestions() {
   suggestionsEl.innerHTML = "";
 
   suggestionBatches.forEach((batch, batchIdx) => {
-    // Batch timestamp divider (not for the first/newest)
-    const divider = document.createElement("div");
-    divider.className = "batch-divider" + (batchIdx > 0 ? " old" : "");
-    divider.textContent = `— BATCH ${suggestionBatches.length - batchIdx} · ${batch.ts} —`;
-    suggestionsEl.appendChild(divider);
+    const isNewest = batchIdx === 0;
 
+    // Render the 3 cards for this batch
     batch.suggestions.forEach((s) => {
+      const typeClass = `type-${s.type.toLowerCase().replace(/_/g, "-")}`;
       const card = document.createElement("div");
-      card.className = `suggestion-card type-${s.type.toLowerCase().replace(/_/g, "-")}`;
-      card.innerHTML = `
-        <div class="suggestion-type">${formatType(s.type)}</div>
-        <div class="suggestion-preview">${escHtml(s.preview)}</div>
-      `;
-      card.addEventListener("click", () => handleSuggestionClick(s));
-      suggestionsEl.insertBefore(card, divider.nextSibling || null);
-
-      // Re-insert: cards before their own divider
-      suggestionsEl.insertBefore(card, divider);
-    });
-    // Move divider after its cards
-    suggestionsEl.appendChild(divider);
-  });
-
-  // Re-render properly: newest batch cards on top, then divider, then older
-  // Simpler approach: rebuild cleanly
-  suggestionsEl.innerHTML = "";
-  suggestionBatches.forEach((batch, batchIdx) => {
-    // Cards for this batch
-    batch.suggestions.forEach((s) => {
-      const card = document.createElement("div");
-      card.className = `suggestion-card type-${s.type.toLowerCase().replace(/_/g, "-")}` + (batchIdx > 0 ? " old-batch" : "");
+      card.className = `suggestion-card ${typeClass}${isNewest ? "" : " old-batch"}`;
       card.innerHTML = `
         <div class="suggestion-type">${formatType(s.type)}</div>
         <div class="suggestion-preview">${escHtml(s.preview)}</div>
@@ -188,7 +237,7 @@ function renderSuggestions() {
       suggestionsEl.appendChild(card);
     });
 
-    // Batch divider after cards
+    // Batch timestamp divider below its cards
     const divider = document.createElement("div");
     divider.className = "batch-divider";
     divider.textContent = `— BATCH ${suggestionBatches.length - batchIdx} · ${batch.ts} —`;
@@ -196,30 +245,52 @@ function renderSuggestions() {
   });
 }
 
+// Human-readable type labels matching the screenshot exactly
 function formatType(type) {
   const labels = {
-    ANSWER: "Answer",
-    FACT_CHECK: "Fact Check",
-    QUESTION: "Question to Ask",
+    ANSWER:        "Answer",
+    FACT_CHECK:    "Fact Check",
+    QUESTION:      "Question to Ask",
     TALKING_POINT: "Talking Point",
-    CLARIFY: "Clarify",
   };
   return labels[type] || type;
 }
 
 // ── Chat ──────────────────────────────────────────────────────────────────────
+
+/**
+ * Clicking a suggestion card:
+ *  1. Shows "YOU · <TYPE>" bubble with the preview text
+ *  2. Sends a richer, expanded-answer prompt to the chat model
+ *     (includes the suggestion's detail_hint + full transcript context)
+ *  3. Streams the response into "ASSISTANT" bubble
+ */
 async function handleSuggestionClick(suggestion) {
-  const userMsg = suggestion.preview;
-  addChatMessage("user", userMsg, suggestion.type);
-  await sendChat(userMsg);
+  if (isChatLoading) return;
+
+  const userContent = suggestion.preview;
+  appendChatBubble("user", userContent, suggestion.type);
+
+  const expandedPrompt =
+    `The user selected a "${formatType(suggestion.type)}" suggestion from the live feed.\n\n` +
+    `Suggestion shown: "${suggestion.preview}"\n\n` +
+    `Context hint: ${suggestion.detail_hint}\n\n` +
+    `Respond using this exact structure:\n` +
+    `Detailed answer to: "${suggestion.preview}"\n\n` +
+    `Then provide 2-4 concise paragraphs with specific details grounded in the transcript.\n` +
+    `End with: Follow-up suggestion: <one actionable next line to say or ask>.\n\n` +
+    `Be specific, cite numbers or named systems when relevant, and keep it actionable.`;
+
+  await sendChatMessage(expandedPrompt, userContent);
 }
 
+// Manual chat input
 chatSendBtn.addEventListener("click", () => {
   const text = chatInput.value.trim();
-  if (!text) return;
+  if (!text || isChatLoading) return;
   chatInput.value = "";
-  addChatMessage("user", text);
-  sendChat(text);
+  appendChatBubble("user", text);
+  sendChatMessage(text, text);
 });
 
 chatInput.addEventListener("keydown", (e) => {
@@ -229,65 +300,65 @@ chatInput.addEventListener("keydown", (e) => {
   }
 });
 
-function addChatMessage(role, content, type = null) {
+function appendChatBubble(role, content, type = null) {
   const ts = nowTime();
   chatHistory.push({ ts, role, content });
 
-  const el = document.createElement("div");
-  el.className = `chat-message ${role}`;
+  const wrapper = document.createElement("div");
+  wrapper.className = `chat-message ${role}`;
+
+  const bubble = document.createElement("div");
+  bubble.className = "chat-bubble";
+  if (content) bubble.textContent = content;
 
   if (role === "user") {
-    const label = type ? `YOU · ${formatType(type).toUpperCase()}` : "YOU";
-    el.innerHTML = `
-      <div class="chat-label">${label}</div>
-      <div class="chat-bubble">${escHtml(content)}</div>
-    `;
+    const label = document.createElement("div");
+    label.className = "chat-label";
+    label.textContent = type ? `YOU · ${formatType(type).toUpperCase()}` : "YOU";
+    wrapper.appendChild(label);
   } else {
-    el.innerHTML = `
-      <div class="chat-label">ASSISTANT</div>
-      <div class="chat-bubble" id="streaming-bubble"></div>
-    `;
+    const label = document.createElement("div");
+    label.className = "chat-label";
+    label.textContent = "ASSISTANT";
+    wrapper.appendChild(label);
   }
 
-  chatMessagesEl.appendChild(el);
+  wrapper.appendChild(bubble);
+  chatMessagesEl.appendChild(wrapper);
   chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
-  return el;
+  return bubble;
 }
 
-async function sendChat(userText) {
-  if (isChatLoading || !apiKey) return;
+async function sendChatMessage(apiContent, displayText) {
   if (!apiKey) { showError("Set your Groq API key in ⚙ Settings."); return; }
-
   isChatLoading = true;
   chatSendBtn.disabled = true;
 
-  // Build messages array from history (exclude the one we just added — it'll be last)
-  const messages = chatHistory.map((m) => ({ role: m.role, content: m.content }));
-  const lines = transcriptLines.map((l) => `${l.ts} ${l.text}`);
+  apiMessages.push({ role: "user", content: apiContent });
 
-  // Add assistant placeholder
-  const assistantEl = addChatMessage("assistant", "");
-  const bubble = assistantEl.querySelector("#streaming-bubble");
+  const bubble = appendChatBubble("assistant", "");
   bubble.classList.add("streaming");
 
   let fullResponse = "";
 
   try {
-    await streamChat(messages, lines, apiKey, (delta) => {
+    const lines = transcriptLines.map((l) => `${l.ts} ${l.text}`);
+
+    await streamChat(apiMessages, lines, apiKey, (delta) => {
       fullResponse += delta;
-      bubble.textContent = fullResponse;
+      bubble.innerHTML = escHtml(fullResponse).replace(/\n\n/g, "</p><p>").replace(/\n/g, "<br>");
       chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
     }, settings);
 
     bubble.classList.remove("streaming");
-    bubble.id = "";
-    // Save to history
-    chatHistory[chatHistory.length - 1] = { ts: nowTime(), role: "assistant", content: fullResponse };
+    apiMessages.push({ role: "assistant", content: fullResponse });
+    chatHistory[chatHistory.length - 1].content = fullResponse;
+
   } catch (e) {
     bubble.classList.remove("streaming");
-    bubble.id = "";
     bubble.textContent = "Error: " + e.message;
     bubble.classList.add("error");
+    apiMessages.pop();
   } finally {
     isChatLoading = false;
     chatSendBtn.disabled = false;
@@ -310,7 +381,7 @@ exportBtn.addEventListener("click", () => {
   const url = URL.createObjectURL(blob);
   const a = document.createElement("a");
   a.href = url;
-  a.download = `meeting-session-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.json`;
+  a.download = `meeting-${new Date().toISOString().slice(0, 19).replace(/:/g, "-")}.json`;
   a.click();
   URL.revokeObjectURL(url);
 });
@@ -318,15 +389,12 @@ exportBtn.addEventListener("click", () => {
 // ── Settings modal ────────────────────────────────────────────────────────────
 function openSettings() {
   apiKeyInput.value = apiKey;
-
-  // Populate all settings fields from current settings or defaults
   document.getElementById("s-suggestion-model").value = settings.suggestion_model || "llama-3.3-70b-versatile";
-  document.getElementById("s-chat-model").value = settings.chat_model || "llama-3.3-70b-versatile";
-  document.getElementById("s-suggestion-ctx").value = settings.suggestion_context_lines || 60;
-  document.getElementById("s-chat-ctx").value = settings.chat_context_lines || 120;
+  document.getElementById("s-chat-model").value        = settings.chat_model       || "llama-3.3-70b-versatile";
+  document.getElementById("s-suggestion-ctx").value   = settings.suggestion_context_lines || 60;
+  document.getElementById("s-chat-ctx").value          = settings.chat_context_lines      || 120;
   document.getElementById("s-suggestion-prompt").value = settings.suggestion_system_prompt || "";
-  document.getElementById("s-chat-prompt").value = settings.chat_system_prompt || "";
-
+  document.getElementById("s-chat-prompt").value       = settings.chat_system_prompt      || "";
   settingsModal.classList.add("open");
 }
 
@@ -340,7 +408,6 @@ settingsSave.addEventListener("click", () => {
   apiKey = apiKeyInput.value.trim();
   localStorage.setItem("groq_api_key", apiKey);
 
-  const overrides = {};
   const sm = document.getElementById("s-suggestion-model").value.trim();
   const cm = document.getElementById("s-chat-model").value.trim();
   const sc = parseInt(document.getElementById("s-suggestion-ctx").value);
@@ -348,6 +415,7 @@ settingsSave.addEventListener("click", () => {
   const sp = document.getElementById("s-suggestion-prompt").value.trim();
   const cp = document.getElementById("s-chat-prompt").value.trim();
 
+  const overrides = {};
   if (sm) overrides.suggestion_model = sm;
   if (cm) overrides.chat_model = cm;
   if (!isNaN(sc)) overrides.suggestion_context_lines = sc;
@@ -362,11 +430,16 @@ settingsSave.addEventListener("click", () => {
 
 // ── Utilities ─────────────────────────────────────────────────────────────────
 function nowTime() {
-  return new Date().toLocaleTimeString("en-US", { hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false });
+  return new Date().toLocaleTimeString("en-US", {
+    hour: "2-digit", minute: "2-digit", second: "2-digit", hour12: false,
+  });
 }
 
 function escHtml(str) {
-  return str.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+  return String(str)
+    .replace(/&/g, "&amp;")
+    .replace(/</g, "&lt;")
+    .replace(/>/g, "&gt;");
 }
 
 function showError(msg) {
@@ -377,7 +450,4 @@ function showError(msg) {
 }
 
 // ── Init ──────────────────────────────────────────────────────────────────────
-// Prompt for API key on first load if not set
-if (!apiKey) {
-  setTimeout(openSettings, 400);
-}
+if (!apiKey) setTimeout(openSettings, 400);

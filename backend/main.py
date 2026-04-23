@@ -11,21 +11,43 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 
-from backend.routes import router
+from routes import router
 
-# Load .env file (silently ignored if it doesn't exist)
 load_dotenv()
 
 # ── App ───────────────────────────────────────────────────────────────────────
-
 app = FastAPI(
     title="Live Meeting Assistant",
     description="Real-time transcript → suggestions → chat, powered by Groq",
     version="1.0.0",
 )
 
+# ── Body size limit ───────────────────────────────────────────────────────────
+# Whisper's hard limit is 25 MB. We allow 26 MB to give a little headroom.
+# Set via uvicorn's --limit-concurrency or here via middleware.
+# The cleanest way in FastAPI is to configure it on the ASGI server side,
+# but we also guard in the route itself. We set it here via a custom middleware
+# so oversized uploads get a clean 413 instead of a cryptic connection reset.
+from starlette.middleware.base import BaseHTTPMiddleware
+from starlette.requests import Request
+from starlette.responses import JSONResponse
+
+MAX_UPLOAD_BYTES = 26 * 1024 * 1024  # 26 MB
+
+class LimitUploadSizeMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if request.method == "POST" and "/api/transcribe" in request.url.path:
+            content_length = request.headers.get("content-length")
+            if content_length and int(content_length) > MAX_UPLOAD_BYTES:
+                return JSONResponse(
+                    status_code=413,
+                    content={"detail": f"Audio chunk too large (max 26 MB). Chunk at 30s is ~1-3 MB — check your encoder."},
+                )
+        return await call_next(request)
+
+app.add_middleware(LimitUploadSizeMiddleware)
+
 # ── CORS ──────────────────────────────────────────────────────────────────────
-# Always allow localhost for dev; extend via CORS_ORIGINS env var for production.
 default_origins = [
     "http://localhost:8000",
     "http://localhost:3000",
@@ -35,12 +57,12 @@ default_origins = [
 ]
 raw_origins = os.getenv("CORS_ORIGINS", "")
 extra = [o.strip() for o in raw_origins.split(",") if o.strip()]
-all_origins = list(dict.fromkeys(default_origins + extra))  # deduplicate, preserve order
+all_origins = list(dict.fromkeys(default_origins + extra))
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=all_origins,
-    allow_origin_regex=r"http://localhost:\d+",  # catch any localhost port
+    allow_origin_regex=r"http://localhost:\d+",
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -50,7 +72,6 @@ app.add_middleware(
 app.include_router(router)
 
 # ── Serve frontend static files ───────────────────────────────────────────────
-# Looks for a /frontend folder next to /python-backend (sibling directory).
 frontend_dir = Path(__file__).parent.parent / "frontend"
 if frontend_dir.exists():
     print(f"✅  Serving frontend from {frontend_dir}")

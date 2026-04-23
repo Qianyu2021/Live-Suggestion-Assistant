@@ -5,6 +5,17 @@
 
 const BASE = "http://localhost:8000";
 
+async function parseErrorResponse(res, fallback) {
+  const text = await res.text().catch(() => "");
+  if (!text) return fallback;
+  try {
+    const data = JSON.parse(text);
+    return data.detail || data.error || fallback;
+  } catch {
+    return text.slice(0, 240) || fallback;
+  }
+}
+
 /**
  * POST /api/transcribe
  * @param {Blob} audioBlob
@@ -18,8 +29,8 @@ export async function transcribeAudio(audioBlob, mimeType, apiKey) {
   form.append("api_key", apiKey);
 
   const res = await fetch(`${BASE}/api/transcribe`, { method: "POST", body: form });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || "Transcription failed");
+  if (!res.ok) throw new Error(await parseErrorResponse(res, "Transcription failed"));
+  const data = await res.json().catch(() => ({}));
   return data.text || "";
 }
 
@@ -42,8 +53,8 @@ export async function fetchSuggestions(transcriptLines, previousSuggestions, api
       settings,
     }),
   });
-  const data = await res.json();
-  if (!res.ok) throw new Error(data.detail || "Suggestions failed");
+  if (!res.ok) throw new Error(await parseErrorResponse(res, "Suggestions failed"));
+  const data = await res.json().catch(() => ({}));
   return data.suggestions || [];
 }
 
@@ -69,8 +80,11 @@ export async function streamChat(messages, transcriptLines, apiKey, onDelta, set
   });
 
   if (!res.ok) {
-    const data = await res.json().catch(() => ({}));
-    throw new Error(data.detail || "Chat failed");
+    throw new Error(await parseErrorResponse(res, "Chat failed"));
+  }
+
+  if (!res.body) {
+    throw new Error("Chat stream unavailable (empty response body)");
   }
 
   const reader = res.body.getReader();
