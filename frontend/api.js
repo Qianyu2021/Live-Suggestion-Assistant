@@ -3,7 +3,13 @@
  * All functions throw on non-2xx or on Groq errors.
  */
 
-const BASE = "http://localhost:8000";
+const BASE = (() => {
+  if (typeof window === "undefined") return "";
+  const host = window.location.hostname;
+  if (host === "localhost" || host === "127.0.0.1") return "http://localhost:8000";
+  // In production (Render), frontend and backend are served by the same origin.
+  return "";
+})();
 
 async function parseErrorResponse(res, fallback) {
   const text = await res.text().catch(() => "");
