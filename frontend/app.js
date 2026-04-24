@@ -23,6 +23,8 @@ let isSuggestLoading   = false;
 let isChatLoading      = false;
 let pendingTranscribes = 0;    // # of in-flight transcribe requests
 let suggestPending     = false;// a refresh was requested but had to wait
+let suggestPendingSettings = null;
+let suggestPendingForce = false;
 let autoRefreshTimer   = null;
 let autoRefreshCountdown = 30;
 let lastSuggestedLineCount = 0; // how many transcript lines existed at last batch
@@ -33,6 +35,24 @@ const AUTO_REFRESH_INTERVAL = 30; // seconds
 const MAX_TRANSCRIPT_LINES_FOR_SUGGEST = 60;
 const MAX_PREV_BATCHES_FOR_SUGGEST = 6;
 const MAX_TRANSCRIPT_LINES_FOR_CHAT = 60;
+const DEFAULT_SUGGESTION_SETTINGS = {
+  suggestion_agentic_enabled: false,
+  suggestion_candidate_count: 1,
+  suggestion_repair_enabled: false,
+};
+const FAST_STOP_SUGGESTION_SETTINGS = {
+  suggestion_agentic_enabled: false,
+  suggestion_candidate_count: 1,
+  suggestion_repair_enabled: false,
+};
+const MANUAL_RELOAD_SUGGESTION_SETTINGS = {
+  suggestion_agentic_enabled: false,
+  suggestion_candidate_count: 1,
+  suggestion_repair_enabled: true,
+};
+const QUALITY_FIRST_CHAT_SETTINGS = {
+  chat_agentic_enabled: true,
+};
 
 // ── DOM refs ──────────────────────────────────────────────────────────────────
 const micBtn         = document.getElementById("mic-btn");
@@ -93,11 +113,8 @@ const recorder = new AudioRecorder(async (blob, mimeType) => {
     showError("Transcription error: " + e.message);
   } finally {
     pendingTranscribes--;
-    // If a refresh was waiting on transcription to land, kick it off now.
-    if (suggestPending && pendingTranscribes === 0) {
-      suggestPending = false;
-      runSuggestions();
-    }
+    processPendingSuggestions();
+    syncStoppedMicStatus();
   }
 });
 
@@ -193,41 +210,48 @@ function updateCountdown() {
  *  • Skips silently if no transcript yet, or if no new lines since the
  *    last batch (no point burning a Groq call on identical input).
  */
-function requestSuggestionsRefresh(force = false) {
+function requestSuggestionsRefresh(force = false, settingsOverride = null) {
   if (transcriptLines.length === 0) return;
   if (!force && transcriptLines.length === lastSuggestedLineCount) return;
 
   if (!force && pendingTranscribes > 0) {
-    suggestPending = true;
+    queueSuggestionsRefresh(settingsOverride, false);
     return;
   }
-  runSuggestions();
+  if (force) lastSuggestedLineCount = -1;
+  runSuggestions(settingsOverride);
 }
 
 function refreshSuggestionsOnStop() {
   if (transcriptLines.length === 0) return;
-  // Force a new batch on stop even if <30s since last auto-refresh.
-  lastSuggestedLineCount = -1;
-  // Wait for final in-flight transcript chunk so suggestions use freshest text.
+  autoRefreshCountdown = AUTO_REFRESH_INTERVAL;
+  updateCountdown();
+  micStatus.textContent = "Stopping… refreshing suggestions.";
+
+  // Show a fresh batch immediately from the latest completed transcript,
+  // then quietly refresh once the final chunk lands.
   if (pendingTranscribes > 0) {
-    suggestPending = true;
+    queueSuggestionsRefresh(FAST_STOP_SUGGESTION_SETTINGS, true);
+    requestSuggestionsRefresh(true, FAST_STOP_SUGGESTION_SETTINGS);
     return;
   }
-  runSuggestions();
+  requestSuggestionsRefresh(true, FAST_STOP_SUGGESTION_SETTINGS);
 }
 
 reloadBtn.addEventListener("click", () => {
   // Manual reload: reset the auto-refresh countdown so we don't double-fire
   autoRefreshCountdown = AUTO_REFRESH_INTERVAL;
   updateCountdown();
-  // Force a refresh even if line count hasn't changed (user explicitly asked)
-  lastSuggestedLineCount = -1;
-  requestSuggestionsRefresh(true);
+  requestSuggestionsRefresh(true, MANUAL_RELOAD_SUGGESTION_SETTINGS);
 });
 
 // ── Suggestions ───────────────────────────────────────────────────────────────
-async function runSuggestions() {
-  if (isSuggestLoading || transcriptLines.length === 0) return;
+async function runSuggestions(settingsOverride = null) {
+  if (transcriptLines.length === 0) return;
+  if (isSuggestLoading) {
+    queueSuggestionsRefresh(settingsOverride, true);
+    return;
+  }
   isSuggestLoading = true;
   reloadBtn.classList.add("loading");
 
@@ -241,7 +265,12 @@ async function runSuggestions() {
     const prevBatches = suggestionBatches
       .slice(0, MAX_PREV_BATCHES_FOR_SUGGEST)
       .map((b) => b.suggestions);
-    const suggestions = await fetchSuggestions(lines, prevBatches, apiKey, settings);
+    const effectiveSettings = {
+      ...DEFAULT_SUGGESTION_SETTINGS,
+      ...settings,
+      ...(settingsOverride || {}),
+    };
+    const suggestions = await fetchSuggestions(lines, prevBatches, apiKey, effectiveSettings);
 
     const batch = { ts: nowTime(), suggestions };
     suggestionBatches.unshift(batch); // newest first
@@ -253,6 +282,37 @@ async function runSuggestions() {
   } finally {
     isSuggestLoading = false;
     reloadBtn.classList.remove("loading");
+    processPendingSuggestions();
+    syncStoppedMicStatus();
+  }
+}
+
+function queueSuggestionsRefresh(settingsOverride = null, force = false) {
+  suggestPending = true;
+  suggestPendingForce = suggestPendingForce || force;
+  if (settingsOverride) {
+    suggestPendingSettings = settingsOverride;
+  } else if (!suggestPendingSettings) {
+    suggestPendingSettings = null;
+  }
+}
+
+function processPendingSuggestions() {
+  if (!suggestPending || pendingTranscribes > 0 || isSuggestLoading || transcriptLines.length === 0) {
+    return;
+  }
+
+  const pendingSettings = suggestPendingSettings;
+  const force = suggestPendingForce;
+  suggestPending = false;
+  suggestPendingSettings = null;
+  suggestPendingForce = false;
+  requestSuggestionsRefresh(force, pendingSettings);
+}
+
+function syncStoppedMicStatus() {
+  if (!isRecording && pendingTranscribes === 0 && !suggestPending && !isSuggestLoading) {
+    micStatus.textContent = "Stopped. Click to resume.";
   }
 }
 
@@ -328,7 +388,7 @@ async function handleSuggestionClick(suggestion) {
     `Then 2-4 short, specific paragraphs grounded in the transcript.\n` +
     `End with: Follow-up suggestion: <one actionable next line>.`;
 
-  await sendChatMessage(expandedPrompt, userContent);
+  await sendChatMessage(expandedPrompt, userContent, { chatAgentic: true });
 }
 
 // Manual chat input
@@ -337,7 +397,7 @@ chatSendBtn.addEventListener("click", () => {
   if (!text || isChatLoading) return;
   chatInput.value = "";
   appendChatBubble("user", text);
-  sendChatMessage(text, text);
+  sendChatMessage(text, text, { chatAgentic: true });
 });
 
 chatInput.addEventListener("keydown", (e) => {
@@ -376,7 +436,7 @@ function appendChatBubble(role, content, type = null) {
   return bubble;
 }
 
-async function sendChatMessage(apiContent, displayText) {
+async function sendChatMessage(apiContent, displayText, opts = {}) {
   if (!apiKey) { showError("Set your Groq API key in ⚙ Settings."); return; }
   isChatLoading = true;
   chatSendBtn.disabled = true;
@@ -402,6 +462,14 @@ async function sendChatMessage(apiContent, displayText) {
     chatMessagesEl.scrollTop = chatMessagesEl.scrollHeight;
   };
 
+  const effectiveSettings = {
+    ...QUALITY_FIRST_CHAT_SETTINGS,
+    ...settings,
+  };
+  if (typeof opts.chatAgentic === "boolean") {
+    effectiveSettings.chat_agentic_enabled = opts.chatAgentic;
+  }
+
   try {
     const lines = transcriptLines
       .slice(-MAX_TRANSCRIPT_LINES_FOR_CHAT)
@@ -414,7 +482,7 @@ async function sendChatMessage(apiContent, displayText) {
         renderQueued = true;
         requestAnimationFrame(renderStream);
       }
-    }, settings);
+    }, effectiveSettings);
 
     if (renderQueued) renderStream();
     bubble.classList.remove("streaming");

@@ -1,0 +1,160 @@
+{
+  "batch_pairs_evaluated": 2,
+  "summary": {
+    "overall_score_100": 3.3,
+    "preview_similarity_100": 25.4,
+    "detail_similarity_100": 7.0,
+    "clicked_answer_similarity_100": 13.0,
+    "standalone_preview_score_100": 95.8,
+    "type_match_rate_100": 66.7,
+    "unsupported_numeric_claim_count": 7
+  },
+  "batch_reports": [
+    {
+      "candidate_batch_ts": "13:33:50",
+      "benchmark_batch_ts": "13:33:50",
+      "matches": [
+        {
+          "candidate_type": "QUESTION",
+          "benchmark_type": "ANSWER",
+          "candidate_preview": "What runtime guardrail strategies will you use to sanitize agent inputs and outputs?",
+          "benchmark_preview": "Guardrails are runtime safeguards that sanitize agent inputs and outputs to enforce safety, policy, and correctness.",
+          "preview_score": 0.443,
+          "detail_score": 0.104,
+          "answer_score": 0.117,
+          "standalone_penalty": 0.0
+        },
+        {
+          "candidate_type": "TALKING_POINT",
+          "benchmark_type": "TALKING_POINT",
+          "candidate_preview": "Implement input validation with OpenAI moderation API and enforce output schema via JSON schema checks.",
+          "benchmark_preview": "Guardrails are the runtime safety layer for both inbound prompts and outbound responses.",
+          "preview_score": 0.105,
+          "detail_score": 0.043,
+          "answer_score": 0.094,
+          "standalone_penalty": 0.0
+        },
+        {
+          "candidate_type": "QUESTION",
+          "benchmark_type": "QUESTION",
+          "candidate_preview": "What metric is currently the bottleneck in this discussion?",
+          "benchmark_preview": "What other runtime controls should be configured alongside system prompts and tool operations?",
+          "preview_score": 0.195,
+          "detail_score": 0.068,
+          "answer_score": 0.124,
+          "standalone_penalty": 0.25
+        }
+      ]
+    },
+    {
+      "candidate_batch_ts": "13:34:05",
+      "benchmark_batch_ts": "13:34:05",
+      "matches": [
+        {
+          "candidate_type": "QUESTION",
+          "benchmark_type": "QUESTION",
+          "candidate_preview": "Which runtime guardrail mechanisms (e.g., content filtering, schema validation) will you enable?",
+          "benchmark_preview": "Which runtime defenses will you use against prompt injection, jailbreaks, and unsafe requests?",
+          "preview_score": 0.336,
+          "detail_score": 0.05,
+          "answer_score": 0.171,
+          "standalone_penalty": 0.0
+        },
+        {
+          "candidate_type": "TALKING_POINT",
+          "benchmark_type": "TALKING_POINT",
+          "candidate_preview": "OpenAI moderation API + JSON schema checks add ~10 ms latency per request while blocking unsafe content.",
+          "benchmark_preview": "Guardrails improve both safety and cost efficiency by blocking off-topic or adversarial requests early.",
+          "preview_score": 0.162,
+          "detail_score": 0.134,
+          "answer_score": 0.157,
+          "standalone_penalty": 0.0
+        },
+        {
+          "candidate_type": "ANSWER",
+          "benchmark_type": "FACT_CHECK",
+          "candidate_preview": "Guardrails are runtime safeguards that sanitize both incoming prompts and outgoing responses.",
+          "benchmark_preview": "Guardrails can significantly reduce prompt-injection risk, but they do not eliminate it on their own.",
+          "preview_score": 0.284,
+          "detail_score": 0.02,
+          "answer_score": 0.118,
+          "standalone_penalty": 0.0
+        }
+      ]
+    }
+  ],
+  "unsupported_numeric_claims": [
+    {
+      "batch_ts": "13:33:50",
+      "preview": "What runtime guardrail strategies will you use to sanitize agent inputs and outputs?",
+      "field": "answer",
+      "values": [
+        "1",
+        "2",
+        "3",
+        "10",
+        "30",
+        "1",
+        "5"
+      ]
+    },
+    {
+      "batch_ts": "13:33:50",
+      "preview": "What metric is currently the bottleneck in this discussion?",
+      "field": "answer",
+      "values": [
+        "120",
+        "8",
+        "115",
+        "6"
+      ]
+    },
+    {
+      "batch_ts": "13:34:05",
+      "preview": "Which runtime guardrail mechanisms (e.g., content filtering, schema validation) will you enable?",
+      "field": "answer",
+      "values": [
+        "300"
+      ]
+    },
+    {
+      "batch_ts": "13:34:05",
+      "preview": "OpenAI moderation API + JSON schema checks add ~10 ms latency per request while blocking unsafe content.",
+      "field": "preview",
+      "values": [
+        "10"
+      ]
+    },
+    {
+      "batch_ts": "13:34:05",
+      "preview": "OpenAI moderation API + JSON schema checks add ~10 ms latency per request while blocking unsafe content.",
+      "field": "detail_hint",
+      "values": [
+        "10"
+      ]
+    },
+    {
+      "batch_ts": "13:34:05",
+      "preview": "OpenAI moderation API + JSON schema checks add ~10 ms latency per request while blocking unsafe content.",
+      "field": "answer",
+      "values": [
+        "10",
+        "10",
+        "180",
+        "190",
+        "4.3",
+        "10"
+      ]
+    },
+    {
+      "batch_ts": "13:34:05",
+      "preview": "Guardrails are runtime safeguards that sanitize both incoming prompts and outgoing responses.",
+      "field": "answer",
+      "values": [
+        "10",
+        "4",
+        "200"
+      ]
+    }
+  ]
+}

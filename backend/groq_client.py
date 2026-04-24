@@ -218,6 +218,30 @@ async def judge_suggestion_candidates(
         return json.loads(raw)
     except json.JSONDecodeError as exc:
         raise ValueError(f"Judge JSON parse failed: {raw[:200]}") from exc
+
+
+async def complete_text(
+    client: AsyncGroq,
+    system_prompt: str,
+    user_prompt: str,
+    model: str,
+    max_tokens: int = 220,
+    temperature: float = 0.2,
+) -> str:
+    """
+    Run a bounded non-streaming completion and return plain text content.
+    Useful for lightweight planning steps in agentic flows.
+    """
+    completion = await client.chat.completions.create(
+        model=model,
+        max_tokens=max_tokens,
+        temperature=temperature,
+        messages=[
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": user_prompt},
+        ],
+    )
+    return (completion.choices[0].message.content or "").strip()
  
  
 async def stream_chat_completion(

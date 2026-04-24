@@ -13,11 +13,24 @@ from dataclasses import replace
 
 from fastapi import APIRouter, File, Form, HTTPException, UploadFile
 from fastapi.responses import StreamingResponse
+from groq import (
+    APIConnectionError,
+    APIStatusError,
+    APITimeoutError,
+    AuthenticationError,
+    BadRequestError,
+    PermissionDeniedError,
+    RateLimitError,
+    UnprocessableEntityError,
+)
 
 from groq_client import (
     make_client,
     transcribe_audio,
     generate_suggestions,
+    generate_suggestions_candidates,
+    judge_suggestion_candidates,
+    complete_text,
     stream_chat_completion,
 )
 from models import ChatRequest, SuggestRequest, SuggestResponse
@@ -41,6 +54,41 @@ def _get_api_key(request_key: str) -> str:
     if not key:
         raise HTTPException(status_code=400, detail="Groq API key is required")
     return key
+
+
+def _format_prompt_or_400(template: str, **values) -> str:
+    """Return a formatted prompt or raise a clear 400 for bad override templates."""
+    try:
+        return template.format(**values)
+    except KeyError as exc:
+        field_name = str(exc).strip("'")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Prompt template references unknown placeholder '{field_name}'",
+        ) from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid prompt template: {exc}") from exc
+
+
+def _provider_http_exception(exc: Exception) -> HTTPException:
+    """Normalize Groq SDK failures into stable FastAPI errors."""
+    if isinstance(exc, AuthenticationError):
+        return HTTPException(status_code=401, detail="Groq authentication failed. Check the API key.")
+    if isinstance(exc, PermissionDeniedError):
+        return HTTPException(status_code=403, detail="Groq denied this request.")
+    if isinstance(exc, RateLimitError):
+        return HTTPException(status_code=429, detail="Groq rate limit exceeded. Please retry shortly.")
+    if isinstance(exc, (BadRequestError, UnprocessableEntityError)):
+        return HTTPException(status_code=400, detail=f"Invalid Groq request: {exc}")
+    if isinstance(exc, APITimeoutError):
+        return HTTPException(status_code=504, detail="Groq request timed out.")
+    if isinstance(exc, APIConnectionError):
+        return HTTPException(status_code=503, detail="Unable to reach Groq right now.")
+    if isinstance(exc, APIStatusError):
+        return HTTPException(status_code=502, detail=f"Groq API error: {exc}")
+    if isinstance(exc, ValueError):
+        return HTTPException(status_code=400, detail=str(exc))
+    return HTTPException(status_code=502, detail=f"Groq error: {exc}")
 
 
 def _derive_context_signals(new_lines: list[str]) -> str:
@@ -77,6 +125,32 @@ def _derive_mix_policy(new_lines: list[str]) -> str:
     return "Prefer QUESTION + TALKING_POINT + ANSWER."
 
 
+def _derive_meeting_mode(new_lines: list[str], recent_lines: list[str]) -> str:
+    """Infer a lightweight meeting mode to improve suggestion targeting."""
+    text = (" ".join(recent_lines[-20:]) + " " + " ".join(new_lines)).lower()
+    if any(tok in text for tok in ["incident", "outage", "sev", "root cause", "rollback"]):
+        return "Incident / troubleshooting mode: prioritize verification, root-cause hypotheses, and mitigation next steps."
+    if any(tok in text for tok in ["roadmap", "timeline", "quarter", "milestone", "priorit"]):
+        return "Planning mode: prioritize trade-offs, sequencing, and decision-driving questions."
+    if any(tok in text for tok in ["customer", "deal", "pricing", "objection", "renewal"]):
+        return "Customer / go-to-market mode: prioritize objections, proof points, and clear business impact framing."
+    if any(tok in text for tok in ["hiring", "interview", "candidate"]):
+        return "Interview mode: prioritize targeted follow-up questions and concrete evidence."
+    return "General technical discussion mode: prioritize concrete questions, actionable talking points, and direct answers."
+
+
+def _derive_timing_objective(new_lines: list[str]) -> str:
+    """Define what is most useful to surface in the next few seconds."""
+    joined = " ".join(new_lines).lower()
+    if "?" in joined:
+        return "A question was just asked; include at least one card that helps answer it immediately."
+    if any(tok in joined for tok in ["decision", "choose", "pick", "go with", "approve"]):
+        return "A decision moment is near; include cards that reduce ambiguity quickly."
+    if any(tok in joined for tok in ["blocked", "bottleneck", "issue", "problem", "stuck"]):
+        return "There may be a blocker; include cards that identify root cause and next action."
+    return "Surface one high-utility next question, one usable talking point, and one direct insight."
+
+
 def _normalize_suggestion(raw: dict) -> dict | None:
     """Coerce model output into the expected suggestion card shape."""
     if not isinstance(raw, dict):
@@ -109,39 +183,204 @@ def _extract_unique_suggestions(payload: dict, blocked_previews: set[str]) -> li
     return out
 
 
+def _is_generic_preview(preview: str) -> bool:
+    p = preview.strip().lower()
+    if len(p) < 18:
+        return True
+    generic_markers = [
+        "ask for more details",
+        "consider tradeoffs",
+        "clarify this point",
+        "discuss next steps",
+        "talk about risks",
+        "gather more context",
+    ]
+    return any(m in p for m in generic_markers)
+
+
+def _preview_needs_click_to_be_useful(preview: str) -> bool:
+    """Detect teaser-style previews that do not stand on their own."""
+    p = " ".join(preview.strip().lower().split())
+    if not p:
+        return True
+
+    teaser_prefixes = (
+        "ask about ",
+        "ask whether ",
+        "check whether ",
+        "clarify whether ",
+        "clarify why ",
+        "discuss ",
+        "explore ",
+        "look into ",
+        "follow up on ",
+        "dig into ",
+    )
+    if any(p.startswith(prefix) for prefix in teaser_prefixes):
+        return True
+
+    teaser_phrases = (
+        "for more details",
+        "to learn more",
+        "to understand better",
+        "for clarification",
+        "more context",
+        "next steps",
+    )
+    return any(phrase in p for phrase in teaser_phrases)
+
+
+def _detail_hint_is_thin(preview: str, detail_hint: str) -> bool:
+    """Ensure click-through detail adds real value beyond the preview."""
+    detail = " ".join(detail_hint.strip().lower().split())
+    prev = " ".join(preview.strip().lower().split())
+    if len(detail) < 50:
+        return True
+    if detail == prev:
+        return True
+    if detail.startswith(prev):
+        suffix = detail[len(prev):].strip(" .:-")
+        if len(suffix) < 24:
+            return True
+    return False
+
+
+def _quality_issues(suggestions: list[dict]) -> list[str]:
+    """Detect weak batches that should trigger a repair pass."""
+    issues: list[str] = []
+    if len(suggestions) != 3:
+        issues.append("not_exactly_three")
+
+    previews = [s.get("preview", "").strip().lower() for s in suggestions if s.get("preview")]
+    if len(set(previews)) != len(previews):
+        issues.append("duplicate_preview")
+
+    types = [s.get("type", "") for s in suggestions]
+    if len(set(types)) < 2:
+        issues.append("low_type_diversity")
+
+    generic_count = sum(1 for s in suggestions if _is_generic_preview(str(s.get("preview", ""))))
+    if generic_count >= 2:
+        issues.append("too_generic")
+
+    preview_teaser_count = sum(
+        1 for s in suggestions if _preview_needs_click_to_be_useful(str(s.get("preview", "")))
+    )
+    if preview_teaser_count >= 1:
+        issues.append("preview_not_standalone")
+
+    thin_detail_count = sum(
+        1
+        for s in suggestions
+        if _detail_hint_is_thin(str(s.get("preview", "")), str(s.get("detail_hint", "")))
+    )
+    if thin_detail_count >= 1:
+        issues.append("detail_hint_not_additive")
+    return issues
+
+
+def _build_suggestion_repair_prompt(
+    recent_lines: list[str],
+    new_lines: list[str],
+    suggestions: list[dict],
+    issues: list[str],
+    context_signals: str,
+    mix_policy: str,
+    meeting_mode: str,
+    timing_objective: str,
+) -> str:
+    """Ask the model to repair a weak suggestion set into a stronger one."""
+    current = "\n".join(
+        f"- [{s.get('type', '')}] {s.get('preview', '')} || hint: {s.get('detail_hint', '')}"
+        for s in suggestions
+    ) or "(none)"
+    issue_text = ", ".join(issues) if issues else "unknown"
+
+    return (
+        "REPAIR THIS SUGGESTION SET.\n"
+        "The current set is weak and must be rewritten.\n\n"
+        "QUALITY ISSUES:\n"
+        f"- {issue_text}\n\n"
+        "RECENT CONTEXT:\n"
+        + "\n".join(recent_lines[-20:])
+        + "\n\nNEW LINES (primary trigger):\n"
+        + "\n".join(new_lines[-10:])
+        + "\n\nCONTEXT SIGNALS:\n"
+        + context_signals
+        + "\n\nSUGGESTION MIX POLICY:\n"
+        + mix_policy
+        + "\n\nMEETING MODE HINT:\n"
+        + meeting_mode
+        + "\n\nTIMING OBJECTIVE:\n"
+        + timing_objective
+        + "\n\nCURRENT WEAK SET:\n"
+        + current
+        + "\n\nReturn valid JSON only with exactly 3 improved suggestions using schema:\n"
+        + '{"suggestions":[{"type":"ANSWER|FACT_CHECK|QUESTION|TALKING_POINT","preview":"...","detail_hint":"..."}]}'
+    )
+
+
 def _fallback_suggestions(new_lines: list[str], blocked_previews: set[str], needed: int) -> list[dict]:
     """
     Deterministic fallback to guarantee exactly 3 cards when model under-returns.
     These still provide useful, clickable value.
     """
-    topic = " ".join(new_lines).strip()
-    if len(topic) > 160:
-        topic = topic[:157] + "..."
+    joined = " ".join(line.strip() for line in new_lines if line.strip())
+    topic = joined[:160] + ("..." if len(joined) > 160 else "")
     if not topic:
         topic = "the latest discussion point"
 
-    templates = [
-        {
-            "type": "QUESTION",
-            "preview": "What metric is currently the bottleneck in this discussion?",
-            "detail_hint": "Ask for one concrete metric (for example p99 latency, error rate, or queue depth) and the current value. This quickly reveals whether the team is blocked by capacity, contention, or configuration.",
-        },
-        {
-            "type": "TALKING_POINT",
-            "preview": "Propose a 2-step plan: isolate the hotspot, then validate with a controlled rollout.",
-            "detail_hint": "Frame a practical plan the team can execute today: identify the dominant hotspot with profiling, then verify improvements behind a staged rollout. This keeps progress measurable and reduces risk.",
-        },
-        {
-            "type": "ANSWER",
-            "preview": "Direct answer: prioritize the highest-impact bottleneck before adding architecture complexity.",
-            "detail_hint": f"Give a concrete answer tied to this context: \"{topic}\". Name the likely primary bottleneck and one specific mitigation to test first, then explain why it should move the metric.",
-        },
-        {
-            "type": "FACT_CHECK",
-            "preview": "Fact-check whether this issue is truly capacity-related or caused by configuration/process.",
-            "detail_hint": "Separate what is known from what is assumed. Compare recent symptoms with known failure modes (capacity saturation vs misconfiguration) to prevent solving the wrong problem.",
-        },
-    ]
+    lower = joined.lower()
+    mentions_guardrails = "guardrail" in lower or "prompt injection" in lower or "jailbreak" in lower
+    mentions_runtime = "runtime" in lower
+    mentions_policy = "policy" in lower or "pii" in lower or "unsafe" in lower
+
+    if mentions_guardrails or mentions_runtime or mentions_policy:
+        templates = [
+            {
+                "type": "QUESTION",
+                "preview": "Which guardrails run before the model versus after the model?",
+                "detail_hint": "Ask the speaker to separate inbound checks from outbound checks so the control points become concrete. This usually surfaces whether they mean moderation, policy checks, schema validation, or response filtering.",
+            },
+            {
+                "type": "TALKING_POINT",
+                "preview": "Guardrails are part of the runtime path, not just an after-the-fact safety review.",
+                "detail_hint": "Use this to frame guardrails as operational infrastructure around the model request lifecycle. It reinforces that the team is discussing controls that act during execution, not only offline audits or policy docs.",
+            },
+            {
+                "type": "ANSWER",
+                "preview": "Guardrails sanitize what enters the agent and validate what leaves it.",
+                "detail_hint": "Answer directly using only the transcript framing: inbound content is checked before the model acts, and outbound content is checked before it reaches users or tools. Expand by naming the risks already mentioned in the transcript, such as prompt injection, PII requests, and off-topic drift.",
+            },
+            {
+                "type": "FACT_CHECK",
+                "preview": "Guardrails reduce prompt-injection risk, but they are not the entire defense on their own.",
+                "detail_hint": "Use this when the conversation risks overstating what sanitization can do. It gives the clicked answer room to explain layered defenses without inventing specific vendors or metrics.",
+            },
+        ]
+    else:
+        templates = [
+            {
+                "type": "QUESTION",
+                "preview": "What is the most important unresolved point in the latest discussion?",
+                "detail_hint": "Ask for the single open question or decision the group still needs to resolve. This keeps the conversation focused on the highest-value next step instead of broadening the topic.",
+            },
+            {
+                "type": "TALKING_POINT",
+                "preview": "Restate the core point in one sentence before the discussion branches further.",
+                "detail_hint": "Use this when the transcript introduces a new concept quickly and the group needs a crisp shared framing. The clicked answer can turn it into concise meeting-ready wording tied to the current topic.",
+            },
+            {
+                "type": "ANSWER",
+                "preview": "Direct answer: summarize the latest point in plain language before adding nuance.",
+                "detail_hint": f"Give a direct, grounded summary of this context: \"{topic}\". The clicked answer should explain the point clearly first, then add only transcript-supported nuance and the most relevant follow-up.",
+            },
+            {
+                "type": "FACT_CHECK",
+                "preview": "Separate what the transcript states clearly from what is still implied or unstated.",
+                "detail_hint": "Use this when the conversation risks jumping from a real statement to an unsupported conclusion. The clicked answer can clarify exactly what is said, what is inferred, and what should be verified next.",
+            },
+        ]
 
     out: list[dict] = []
     seen = set(blocked_previews)
@@ -178,6 +417,30 @@ def _trim_chat_messages(messages: list[dict], max_messages: int, max_chars: int)
     return list(reversed(kept))
 
 
+def _build_suggestion_judge_prompt(
+    recent_lines: list[str],
+    new_lines: list[str],
+    candidates: list[list[dict]],
+) -> str:
+    """Create compact judge input with context + candidate sets."""
+    blocks = []
+    for idx, cand in enumerate(candidates):
+        blocks.append(f"CANDIDATE {idx}:")
+        for s in cand:
+            blocks.append(
+                f"- [{s.get('type', '')}] {s.get('preview', '')} || hint: {s.get('detail_hint', '')}"
+            )
+    return (
+        "RECENT CONTEXT:\n"
+        + "\n".join(recent_lines[-20:])
+        + "\n\nNEW LINES:\n"
+        + "\n".join(new_lines[-8:])
+        + "\n\nCANDIDATE SETS:\n"
+        + "\n".join(blocks)
+        + "\n\nChoose the best candidate index."
+    )
+
+
 # ── POST /api/transcribe ──────────────────────────────────────────────────────
 
 @router.post("/transcribe")
@@ -204,10 +467,8 @@ async def transcribe(
             mime_type=audio.content_type or "audio/webm",
         )
         return {"text": text}
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq error: {exc}") from exc
+        raise _provider_http_exception(exc) from exc
 
 
 # ── POST /api/suggest ─────────────────────────────────────────────────────────
@@ -232,16 +493,23 @@ async def suggest(req: SuggestRequest):
     new_count = max(1, min(cfg.suggestion_new_lines, len(recent)))
     context_lines = recent[:-new_count]
     new_lines = recent[-new_count:]
+    context_signals = _derive_context_signals(new_lines)
+    mix_policy = _derive_mix_policy(new_lines)
+    meeting_mode = _derive_meeting_mode(new_lines, recent)
+    timing_objective = _derive_timing_objective(new_lines)
 
     # Fill placeholders for both the current prompt template and any legacy
     # user overrides saved in localStorage.
-    user_prompt = cfg.suggestion_user_prompt.format(
+    user_prompt = _format_prompt_or_400(
+        cfg.suggestion_user_prompt,
         context_count=len(context_lines),
         context_transcript="\n".join(context_lines) if context_lines else "(none)",
         new_count=len(new_lines),
         new_transcript="\n".join(new_lines) if new_lines else "(none)",
-        context_signals=_derive_context_signals(new_lines),
-        mix_policy=_derive_mix_policy(new_lines),
+        context_signals=context_signals,
+        mix_policy=mix_policy,
+        meeting_mode=meeting_mode,
+        timing_objective=timing_objective,
         context_lines=cfg.suggestion_context_lines,
         transcript="\n".join(recent),
     )
@@ -260,18 +528,107 @@ async def suggest(req: SuggestRequest):
 
     try:
         client = make_client(key)
-        result = await generate_suggestions(client, system_prompt, user_prompt, cfg.suggestion_model)
+        suggestions: list[dict] = []
 
-        suggestions = _extract_unique_suggestions(result, previous_preview_keys)
+        if cfg.suggestion_agentic_enabled and int(cfg.suggestion_candidate_count) > 1:
+            candidate_payloads = await generate_suggestions_candidates(
+                client,
+                system_prompt,
+                user_prompt,
+                cfg.suggestion_model,
+                candidate_count=min(int(cfg.suggestion_candidate_count), 4),
+            )
+            candidate_sets = [
+                _extract_unique_suggestions(payload, previous_preview_keys)
+                for payload in candidate_payloads
+            ]
+            candidate_sets = [c for c in candidate_sets if c]
+
+            if candidate_sets:
+                judge_prompt = _build_suggestion_judge_prompt(recent, new_lines, candidate_sets)
+                judge = await judge_suggestion_candidates(
+                    client,
+                    cfg.suggestion_judge_system_prompt,
+                    judge_prompt,
+                    cfg.suggestion_judge_model,
+                )
+                best_idx = int(judge.get("best_index", 0))
+                if best_idx < 0 or best_idx >= len(candidate_sets):
+                    best_idx = 0
+                suggestions = candidate_sets[best_idx]
+
+        if not suggestions:
+            result = await generate_suggestions(client, system_prompt, user_prompt, cfg.suggestion_model)
+            suggestions = _extract_unique_suggestions(result, previous_preview_keys)
+
+        if cfg.suggestion_repair_enabled:
+            issues_before = _quality_issues(suggestions[:3])
+            if issues_before:
+                repair_prompt = _build_suggestion_repair_prompt(
+                    recent,
+                    new_lines,
+                    suggestions[:3],
+                    issues_before,
+                    context_signals,
+                    mix_policy,
+                    meeting_mode,
+                    timing_objective,
+                )
+                repaired_raw = await generate_suggestions(
+                    client,
+                    system_prompt,
+                    repair_prompt,
+                    cfg.suggestion_model,
+                )
+                repaired = _extract_unique_suggestions(repaired_raw, previous_preview_keys)
+
+                if repaired:
+                    # Quality-first tie-break: let judge pick between original and repaired.
+                    original_top = suggestions[:3]
+                    repaired_top = repaired[:3]
+                    original_with_fallback = list(original_top)
+                    if len(original_with_fallback) < 3:
+                        blocked = previous_preview_keys | {
+                            s["preview"].strip().lower() for s in original_with_fallback
+                        }
+                        original_with_fallback.extend(
+                            _fallback_suggestions(new_lines, blocked, 3 - len(original_with_fallback))
+                        )
+                    repaired_with_fallback = list(repaired_top)
+                    if len(repaired_with_fallback) < 3:
+                        blocked = previous_preview_keys | {
+                            s["preview"].strip().lower() for s in repaired_with_fallback
+                        }
+                        repaired_with_fallback.extend(
+                            _fallback_suggestions(new_lines, blocked, 3 - len(repaired_with_fallback))
+                        )
+
+                    duel_candidates = [original_with_fallback[:3], repaired_with_fallback[:3]]
+                    try:
+                        duel_prompt = _build_suggestion_judge_prompt(recent, new_lines, duel_candidates)
+                        duel = await judge_suggestion_candidates(
+                            client,
+                            cfg.suggestion_judge_system_prompt,
+                            duel_prompt,
+                            cfg.suggestion_judge_model,
+                        )
+                        best_duel = int(duel.get("best_index", 0))
+                        suggestions = duel_candidates[1] if best_duel == 1 else duel_candidates[0]
+                    except Exception:
+                        # If duel judge fails, keep whichever has fewer obvious issues.
+                        repaired_issues = _quality_issues(repaired_with_fallback[:3])
+                        suggestions = (
+                            repaired_with_fallback
+                            if len(repaired_issues) < len(issues_before)
+                            else original_with_fallback
+                        )
 
         # Fast path: skip an extra model round-trip; fill missing cards locally.
         if len(suggestions) < 3:
             blocked = previous_preview_keys | {s['preview'].strip().lower() for s in suggestions}
             suggestions.extend(_fallback_suggestions(new_lines, blocked, 3 - len(suggestions)))
-    except ValueError as exc:
-        raise HTTPException(status_code=502, detail=str(exc)) from exc
     except Exception as exc:
-        raise HTTPException(status_code=502, detail=f"Groq error: {exc}") from exc
+        raise _provider_http_exception(exc) from exc
 
     suggestions = suggestions[:3]
     if not suggestions:
@@ -313,7 +670,8 @@ async def chat(req: ChatRequest):
     # synthetic user→assistant exchange. Check if already injected by
     # looking at the very first message we'd have added previously.
     if recent_lines:
-        transcript_block = cfg.chat_context_injection.format(
+        transcript_block = _format_prompt_or_400(
+            cfg.chat_context_injection,
             line_count=len(recent_lines),
             transcript="\n".join(recent_lines),
         )
@@ -327,16 +685,45 @@ async def chat(req: ChatRequest):
             *messages,
         ]
 
+    planner_notes = ""
+    if cfg.chat_agentic_enabled:
+        try:
+            latest_user = ""
+            for msg in reversed(req.messages):
+                if msg.role == "user":
+                    latest_user = msg.content
+                    break
+            if latest_user:
+                planner_user_prompt = (
+                    f"LATEST USER TEXT:\n{latest_user}\n\n"
+                    f"RECENT TRANSCRIPT LINES:\n{chr(10).join(recent_lines[-20:])}"
+                )
+                client = make_client(key)
+                planner_notes = await complete_text(
+                    client,
+                    cfg.chat_planner_system_prompt,
+                    planner_user_prompt,
+                    cfg.chat_planner_model,
+                    max_tokens=180,
+                    temperature=0.2,
+                )
+        except Exception:
+            planner_notes = ""
+
     async def event_stream():
         try:
             client = make_client(key)
+            system_prompt = cfg.chat_system_prompt
+            if planner_notes:
+                system_prompt += f"\n\nINTERNAL RESPONSE PLAN:\n{planner_notes}\nFollow this plan."
             async for delta in stream_chat_completion(
-                client, messages, cfg.chat_model, cfg.chat_system_prompt
+                client, messages, cfg.chat_model, system_prompt
             ):
                 yield f"data: {json.dumps({'delta': delta})}\n\n"
             yield "data: [DONE]\n\n"
         except Exception as exc:
-            yield f"data: {json.dumps({'error': str(exc)})}\n\n"
+            err = _provider_http_exception(exc)
+            yield f"data: {json.dumps({'error': err.detail, 'status_code': err.status_code})}\n\n"
 
     return StreamingResponse(
         event_stream(),

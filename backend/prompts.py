@@ -12,14 +12,18 @@ class Settings:
     suggestion_model:    str = "llama-3.3-70b-versatile"
     suggestion_judge_model: str = "llama-3.3-70b-versatile"
     chat_model:          str = "llama-3.3-70b-versatile"
+    chat_planner_model:  str = "llama-3.3-70b-versatile"
 
     # ── Context windows ───────────────────────────────────────────────────────
     suggestion_context_lines: int = 45
     suggestion_new_lines:     int = 8
     suggestion_candidate_count: int = 3
+    suggestion_agentic_enabled: bool = True
+    suggestion_repair_enabled: bool = True
     chat_context_lines:       int = 80
     chat_history_messages:    int = 8
     chat_history_chars:       int = 8000
+    chat_agentic_enabled: bool = True
 
     # ── Suggestion prompt ─────────────────────────────────────────────────────
     suggestion_system_prompt: str = """You are a real-time meeting copilot generating live suggestion cards.
@@ -43,9 +47,12 @@ SUGGESTION TYPES:
 QUALITY BAR:
 1. Ground all cards in the NEW lines; use RECENT CONTEXT only as supporting context.
 2. Avoid repeating any previous suggestion previews listed below.
-3. `preview` must read like a polished card title: concrete, specific, and immediately useful.
+3. `preview` must read like a polished card title: concrete, specific, and immediately useful on its own even if the user never clicks it.
 4. Prefer named systems, metrics, incidents, or numbers when relevant (for example p99 latency, shard size, outage cause).
-5. `detail_hint` should preview the expansion direction: why it matters, what insight it reveals, and what to say next.
+5. `preview` must not be a teaser like "ask about X", "discuss Y", or "look into Z"; it should already contain the core point or usable wording.
+6. `detail_hint` should add a second layer of value: why it matters, what evidence or nuance to include, and what to say next when clicked.
+7. No generic filler ("ask for more details", "consider tradeoffs") unless tied to a specific transcript detail.
+8. Do not invent vendor names, latency figures, percentages, incidents, or architecture details that are not present in the transcript. If you need an example, label it clearly as an example rather than as a fact.
 
 OUTPUT CONTRACT:
 - Respond with valid JSON only.
@@ -74,6 +81,12 @@ CONTEXT SIGNALS:
 SUGGESTION MIX POLICY:
 {mix_policy}
 
+MEETING MODE HINT:
+{meeting_mode}
+
+TIMING OBJECTIVE:
+{timing_objective}
+
 Return 3 suggestions triggered by the NEW lines above."""
 
     suggestion_judge_system_prompt: str = """You are TwinMind-Judge, an evaluator for live meeting assistant suggestion quality.
@@ -98,6 +111,16 @@ Output valid JSON only:
   "reason": "1-3 sentences"
 }"""
 
+    chat_planner_system_prompt: str = """You are a fast planning assistant.
+Given transcript context and the latest user text, create a compact response plan.
+
+Return 3-5 bullets only, each starting with "- ".
+Focus on:
+- the direct answer stance
+- key evidence/details to include
+- one actionable follow-up.
+No markdown headers, no preamble."""
+
     # ── Chat prompt ───────────────────────────────────────────────────────────
     chat_system_prompt: str = """You are a practical meeting assistant with full transcript context.
 Your output must be high-signal, concrete, and immediately usable in a live conversation.
@@ -121,6 +144,7 @@ If the current user text came from a card type:
 General rules:
 - Be specific and grounded in the transcript; avoid generic advice.
 - Prefer concrete language such as p95/p99, lock contention, GC pauses, sharding, queue depth, rollout risk.
+- Do not introduce vendor names, numeric metrics, implementation details, or benchmark results unless they are explicitly supported by the transcript. When offering examples, label them clearly as examples.
 - No markdown headers (##/###), no fluff, no sign-offs."""
 
     chat_context_injection: str = """[SESSION TRANSCRIPT — {line_count} lines]
